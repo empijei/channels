@@ -53,6 +53,8 @@ TODO: point out
 TODO: express operators in terms of other operators.
 
 TODO: make time related operators get a clock in input
+
+TODO: say that there is no reduce because we have closures
 */
 
 ///////////
@@ -410,31 +412,24 @@ func BufferCount[T any](count int) Operator[T, []T] {
 	if count <= 0 {
 		count = 1
 	}
-	return func(in <-chan T) <-chan []T {
-		out := make(chan []T)
-		go func() {
-			defer close(out)
-
-			var buf []T
-			emitBuf := func() {
-				if len(buf) == 0 {
-					return
-				}
-				out <- buf
-				buf = nil
+	buf := make([]T, 0, count)
+	return MapFilterCancelTeardown(
+		func(in T) (o []T, emit, last bool) {
+			if len(buf) >= count {
+				tmp := buf
+				buf = make([]T, 0, count)
+				return tmp, true, false
 			}
-
-			for v := range in {
-				buf = append(buf, v)
-				if len(buf) >= count {
-					emitBuf()
-				}
+			buf = append(buf, in)
+			return nil, false, false
+		},
+		nil,
+		func() ([]T, bool) {
+			if len(buf) == 0 {
+				return nil, false
 			}
-			emitBuf()
-		}()
-
-		return out
-	}
+			return buf, true
+		})
 }
 
 func BufferTime[T any](duration time.Duration) Operator[T, []T] {
@@ -598,6 +593,18 @@ func MapCancel[I, O any](project func(in I) (projected O, ok bool), cancelParent
 }
 
 func MapFilterCancel[I, O any](project func(in I) (projected O, shouldEmit, isLast bool), cancelParent func()) Operator[I, O] {
+	return MapFilterCancelTeardown(
+		project,
+		cancelParent,
+		nil,
+	)
+}
+
+func MapFilterCancelTeardown[I, O any](
+	project func(in I) (projected O, shouldEmit, isLast bool),
+	cancelParent func(),
+	teardown func() (lastItem O, shouldEmitLast bool),
+) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 		go func() {
@@ -609,35 +616,17 @@ func MapFilterCancel[I, O any](project func(in I) (projected O, shouldEmit, isLa
 				}
 				if isLast {
 					drain(in, cancelParent)
-					return
+					break
 				}
 			}
-		}()
-		return out
-	}
-}
-
-// This is just getting too silly, even for this joke project
-func MapFilterCancelAccum[I, O, A any](
-	project func(accum A, in I) (newAccum A, projected O, shouldEmit, isLast bool),
-	cancelParent func(),
-	seed A) Operator[I, O] {
-	return func(in <-chan I) <-chan O {
-		out := make(chan O)
-		go func() {
-			defer close(out)
-			accum := seed
-			for v := range in {
-				naccum, t, shouldEmit, isLast := project(accum, v)
-				accum = naccum
-				if shouldEmit {
-					out <- t
-				}
-				if isLast {
-					drain(in, cancelParent)
-					return
-				}
+			if teardown == nil {
+				return
 			}
+			l, e := teardown()
+			if !e {
+				return
+			}
+			out <- l
 		}()
 		return out
 	}
@@ -916,22 +905,18 @@ func IgnoreElements[D any]() Operator[D, struct{}] {
 }
 
 func Last[T any]() Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			var t T
-			read := false
-			for v := range in {
-				read = true
-				t = v
-			}
-			if read {
-				out <- t
-			}
-		}()
-		return out
-	}
+	var v T
+	emitted := false
+	return MapFilterCancelTeardown(
+		func(in T) (o T, emit, last bool) {
+			v = in
+			emitted = true
+			return in, false, false
+		},
+		nil,
+		func() (T, bool) {
+			return v, emitted
+		})
 }
 
 func Sample[T, D any](emit <-chan D) Operator[T, T] {
@@ -980,21 +965,16 @@ func Skip[T any](count int) Operator[T, T] {
 }
 
 func SkipLast[T any](count int) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			buf := make(chan T, count)
-			for v := range in {
-				if len(buf) >= count {
-					oldest := <-buf
-					out <- oldest
-				}
-				buf <- v
-			}
-		}()
-		return out
-	}
+	buf := make(chan T, count)
+	return MapFilter(func(in T) (T, bool) {
+		if len(buf) < count {
+			buf <- in
+			return in, false
+		}
+		ret := <-buf
+		buf <- in
+		return ret, true
+	})
 }
 
 ////////////////////
@@ -1096,41 +1076,62 @@ func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] 
 ///////////////////////////////////////
 
 func DefaultIfEmpty[T any](deflt T) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			emitted := false
-			for v := range in {
-				emitted = true
-				out <- v
-			}
-			if !emitted {
-				out <- deflt
-			}
-		}()
-		return out
-	}
+	emitted := false
+	return MapFilterCancelTeardown(
+		func(in T) (o T, emit, last bool) {
+			emitted = true
+			return in, true, false
+		},
+		nil,
+		func() (T, bool) {
+			return deflt, !emitted
+		})
 }
 
 func Every[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
-	return func(in <-chan T) <-chan bool {
-		out := make(chan bool)
-		go func() {
-			defer close(out)
-			for v := range in {
-				if ok := predicate(v); ok {
-					continue
-				}
-				drain(in, cancelParent)
-				out <- false
-				return
+	ok := true
+	return MapFilterCancelTeardown(
+		func(in T) (o bool, emit, last bool) {
+			if ok := predicate(in); ok {
+				return true, false, false
 			}
-			out <- true
-		}()
-		return out
-	}
+			ok = false
+			return false, true, true
+		},
+		nil,
+		func() (bool, bool) {
+			return ok, ok
+		})
 }
+
+func FindIndex[T any](predicate func(T) bool, cancelParent func()) Operator[T, int] {
+	count := 0
+	return MapFilterCancel(func(in T) (out int, e, l bool) {
+		if ok := predicate(in); ok {
+			return count, true, true
+		}
+		count++
+		return 0, false, false
+	}, cancelParent)
+}
+
+func IsEmpty[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
+	emitted := false
+	return MapFilterCancelTeardown(
+		func(in T) (o bool, emit, last bool) {
+			emitted = true
+
+			return false, true, true
+		},
+		nil,
+		func() (bool, bool) {
+			return !emitted, !emitted
+		})
+}
+
+//////////////////////////////////////////
+// Mathematical and Aggregate Operators //
+//////////////////////////////////////////
 
 /*
 	return func(in <-chan T) <-chan T {

@@ -83,8 +83,7 @@ Conditional and Boolean Operators
 
 * [x] defaultIfEmpty
 * [x] every
-* [ ] find // Filter+Take(1)?
-* [ ] findIndex // At???
+* [x] findIndex // At???
 * [ ] isEmpty // This should be a consumer
 
 Mathematical and Aggregate Operators
