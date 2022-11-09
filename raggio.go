@@ -85,6 +85,8 @@ type (
 		A A
 		B B
 	}
+
+	Nothing = struct{}
 )
 
 ////////////////////////
@@ -213,12 +215,12 @@ func CombineLatest[A, B any]() ZipOperator[A, B, Pair[A, B]] {
 	}
 }
 
-func Concat[T any]() FanInOperator[T, T] {
-	return func(chans []<-chan T) <-chan T {
+func Concat[T any]() Operator[<-chan T, T] {
+	return func(chans <-chan (<-chan T)) <-chan T {
 		out := make(chan T)
 		go func() {
 			defer close(out)
-			for _, c := range chans {
+			for c := range chans {
 				c := c
 				for v := range c {
 					out <- v
@@ -229,27 +231,14 @@ func Concat[T any]() FanInOperator[T, T] {
 	}
 }
 
-func Merge[T any]() FanInOperator[T, T] {
-	return func(chans []<-chan T) <-chan T {
+func Merge[T any]() Operator[<-chan T, T] {
+	return func(chans <-chan (<-chan T)) <-chan T {
 		out := make(chan T)
-
-		var wg sync.WaitGroup
-		wg.Add(len(chans))
-		go func() {
-			defer close(out)
-			wg.Wait()
-		}()
-
-		for _, c := range chans {
-			c := c
-			go func() {
-				defer wg.Done()
-				for v := range c {
-					out <- v
-				}
-			}()
+		for c := range chans {
+			for v := range c {
+				out <- v
+			}
 		}
-
 		return out
 	}
 }
@@ -418,11 +407,10 @@ func Buffer[T, D any](emit <-chan D) Operator[T, []T] {
 }
 
 func BufferCount[T any](count int) Operator[T, []T] {
+	if count <= 0 {
+		count = 1
+	}
 	return func(in <-chan T) <-chan []T {
-		if count <= 0 {
-			count = 1
-		}
-
 		out := make(chan []T)
 		go func() {
 			defer close(out)
@@ -541,22 +529,10 @@ func BufferToggle[T, I1, I2 any](openings <-chan I1, closings <-chan I2) Operato
 }
 
 func ConcatMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
-	return func(in <-chan I) <-chan O {
-		out := make(chan O)
-
-		go func() {
-			defer close(out)
-
-			for v := range in {
-				inner := project(v)
-				for v := range inner {
-					out <- v
-				}
-			}
-		}()
-
-		return out
-	}
+	return Combine(
+		Map(project),
+		Concat[O](),
+	)
 }
 
 func ExhaustMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
@@ -602,30 +578,65 @@ func ExhaustMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 }
 
 func Map[I, O any](project func(in I) O) Operator[I, O] {
+	return MapCancel(func(in I) (o O, ok bool) {
+		return project(in), true
+	}, nil)
+}
+
+func MapFilter[I, O any](project func(in I) (projected O, emit bool)) Operator[I, O] {
+	return MapFilterCancel(func(in I) (o O, e, l bool) {
+		o, emit := project(in)
+		return o, emit, false
+	}, nil)
+}
+
+func MapCancel[I, O any](project func(in I) (projected O, ok bool), cancelParent func()) Operator[I, O] {
+	return MapFilterCancel(func(in I) (o O, e, l bool) {
+		o, ok := project(in)
+		return o, true, ok
+	}, cancelParent)
+}
+
+func MapFilterCancel[I, O any](project func(in I) (projected O, shouldEmit, isLast bool), cancelParent func()) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 		go func() {
 			defer close(out)
 			for v := range in {
-				out <- project(v)
+				t, shouldEmit, isLast := project(v)
+				if shouldEmit {
+					out <- t
+				}
+				if isLast {
+					drain(in, cancelParent)
+					return
+				}
 			}
 		}()
 		return out
 	}
 }
 
-func MapCancel[I, O any](project func(in I) (projected O, ok bool), cancelParent func()) Operator[I, O] {
+// This is just getting too silly, even for this joke project
+func MapFilterCancelAccum[I, O, A any](
+	project func(accum A, in I) (newAccum A, projected O, shouldEmit, isLast bool),
+	cancelParent func(),
+	seed A) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 		go func() {
 			defer close(out)
+			accum := seed
 			for v := range in {
-				t, ok := project(v)
-				if !ok {
+				naccum, t, shouldEmit, isLast := project(accum, v)
+				accum = naccum
+				if shouldEmit {
+					out <- t
+				}
+				if isLast {
 					drain(in, cancelParent)
 					return
 				}
-				out <- t
 			}
 		}()
 		return out
@@ -663,27 +674,20 @@ func MergeMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 }
 
 func PairWise[T any]() Operator[T, [2]T] {
-	return func(in <-chan T) <-chan [2]T {
-		out := make(chan [2]T)
-
-		go func() {
-			defer close(out)
-
-			var buf [2]T
-			cur := 0
-			for v := range in {
-				buf[cur] = v
-				cur++
-				if cur < 2 {
-					continue
-				}
-				out <- buf
-				cur = 0
-			}
-		}()
-
-		return out
-	}
+	var (
+		buf         [2]T
+		emittedOnce bool
+	)
+	return MapFilter(func(in T) (o [2]T, e bool) {
+		if !emittedOnce {
+			buf[1] = in
+			emittedOnce = true
+			return o, false
+		}
+		buf[0] = buf[1]
+		buf[1] = in
+		return buf, true
+	})
 }
 
 func Scan[I, O any](project func(accum O, cur I) O, seed O) Operator[I, O] {
@@ -808,189 +812,107 @@ func Audit[T, D any](emit <-chan D) Operator[T, T] {
 }
 
 func Filter[T any](predicate func(T) bool) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
+	return MapFilter(func(in T) (o T, emit bool) {
+		return in, predicate(in)
+	})
+}
 
-			for v := range in {
-				if !predicate(v) {
-					continue
-				}
-				out <- v
-			}
-		}()
-		return out
-	}
+func FilterCancel[T any](predicate func(T) (emit, last bool), cancelParent func()) Operator[T, T] {
+	return MapFilterCancel(func(in T) (out T, e, l bool) {
+		e, l = predicate(in)
+		return in, e, l
+	}, cancelParent)
 }
 
 func Distinct[T comparable]() Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			seen := map[T]bool{}
-			for v := range in {
-				if seen[v] {
-					continue
-				}
-				seen[v] = true
-				out <- v
-			}
-		}()
-		return out
-	}
+	seen := map[T]bool{}
+	return Filter(func(in T) bool {
+		if seen[in] {
+			return false
+		}
+		seen[in] = true
+		return true
+	})
 }
 
-func DistinctKeyer[T any, K comparable](keyer func(T) K) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			seen := map[K]bool{}
-			for v := range in {
-				k := keyer(v)
-				if seen[k] {
-					continue
-				}
-				seen[k] = true
-				out <- v
-			}
-		}()
-		return out
-	}
+func DistinctUntilChangedFunc[T any](equals func(T, T) bool) Operator[T, T] {
+	first := true
+	var prev T
+	return Filter(func(in T) bool {
+		if first {
+			first = false
+			return true
+		}
+		tmp := prev
+		prev = in
+		if equals(tmp, in) {
+			return false
+		}
+		return true
+	})
+}
+
+func DistinctKeyer[T any, K comparable](key func(T) K) Operator[T, T] {
+	return DistinctUntilChangedFunc(func(a, b T) bool {
+		return key(a) == key(b)
+	})
 }
 
 func DistinctUntilChanged[T comparable]() Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			first := true
-			var prev T
-			for v := range in {
-				if first {
-					first = false
-					prev = v
-					out <- v
-					continue
-				}
-				if prev == v {
-					continue
-				}
-				out <- v
-			}
-		}()
-		return out
-	}
+	return DistinctUntilChangedFunc(func(a, b T) bool {
+		return a == b
+	})
 }
 
 func DistinctUntilChangedEqualer[T interface{ Equals(T) bool }]() Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			first := true
-			var prev T
-			for v := range in {
-				if first {
-					first = false
-					prev = v
-					out <- v
-					continue
-				}
-				if prev.Equals(v) {
-					continue
-				}
-				out <- v
-			}
-		}()
-		return out
-	}
+	return DistinctUntilChangedFunc(func(a, b T) bool {
+		return a.Equals(b)
+	})
 }
 
 func At[T any](index int, cancelParent func()) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			cur := 0
-			for v := range in {
-				if cur != index {
-					cur++
-					continue
-				}
-				out <- v
-				drain(in, cancelParent)
-				return
-			}
-		}()
-		return out
-	}
+	cur := 0
+	return FilterCancel(func(in T) (emit, last bool) {
+		if cur == index {
+			return true, true
+		}
+		cur++
+		return false, false
+	}, cancelParent)
 }
 
 func AtWithDefault[T any](index int, deflt T, cancelParent func()) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			cur := 0
-			for v := range in {
-				if cur != index {
-					cur++
-					continue
-				}
-				out <- v
-				drain(in, cancelParent)
-				return
-			}
-			out <- deflt
-		}()
-		return out
-	}
+	return Combine(
+		At[T](index, cancelParent),
+		DefaultIfEmpty(deflt),
+	)
 }
 
 func Take[T any](count int, cancelParent func()) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		if count == 0 {
-			close(out)
-			return out
+	cur := 0
+	return FilterCancel(func(in T) (emit, last bool) {
+		if cur >= count {
+			return false, true
 		}
-		go func() {
-			defer close(out)
-			cur := 0
-			for v := range in {
-				if cur >= count {
-					drain(in, cancelParent)
-					return
-				}
-				out <- v
-				cur++
-			}
-		}()
-		return out
-	}
+		cur++
+		return true, false
+	}, cancelParent)
 }
 
 func First[T any](predicate func(T) bool, cancelParent func()) Operator[T, T] {
 	if predicate == nil {
 		predicate = func(T) bool { return true }
 	}
-	// TODO: why are types needed here?
-	return Combine[T, T, T](Filter[T](predicate), Take[T](1, cancelParent))
+	return Combine(
+		Filter(predicate),
+		Take[T](1, cancelParent),
+	)
 }
 
 func IgnoreElements[D any]() Operator[D, struct{}] {
-	return func(in <-chan D) <-chan struct{} {
-		out := make(chan struct{})
-		go func() {
-			defer close(out)
-			for range in {
-			}
-		}()
-		return out
-	}
+	return Map(func(d D) Nothing {
+		return Nothing{}
+	})
 }
 
 func Last[T any]() Operator[T, T] {
@@ -1047,22 +969,14 @@ func Sample[T, D any](emit <-chan D) Operator[T, T] {
 }
 
 func Skip[T any](count int) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-			cur := 0
-			for v := range in {
-				if cur < count {
-					cur++
-					continue
-				}
-				out <- v
-			}
-
-		}()
-		return out
-	}
+	cur := 0
+	return Filter(func(in T) bool {
+		if cur < count {
+			cur++
+			return false
+		}
+		return true
+	})
 }
 
 func SkipLast[T any](count int) Operator[T, T] {
@@ -1139,18 +1053,18 @@ func WithLatestFrom[I, L any](other <-chan L, cancelOther, cancelParent func()) 
 ///////////////////////
 
 func Tap[T any](observer func(T)) Operator[T, T] {
-	return Map[T, T](func(t T) T {
+	return Map(func(t T) T {
 		observer(t)
 		return t
 	})
 }
 
 func Delay[T any](duration time.Duration) Operator[T, T] {
-	return Tap[T](func(T) { time.Sleep(duration) })
+	return Tap(func(T) { time.Sleep(duration) })
 }
 
 func DelayWhen[T, D any](when <-chan D) Operator[T, T] {
-	return Tap[T](func(T) { <-when })
+	return Tap(func(T) { <-when })
 }
 
 func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] {
@@ -1176,17 +1090,6 @@ func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] 
 		return out
 	}
 }
-
-/*
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
-		go func() {
-			defer close(out)
-
-		}()
-		return out
-	}
-*/
 
 ///////////////////////////////////////
 // Conditional and Boolean Operators //
@@ -1228,6 +1131,17 @@ func Every[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool]
 		return out
 	}
 }
+
+/*
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+
+		}()
+		return out
+	}
+*/
 
 /////////////////////////
 // Consuming Operators //
