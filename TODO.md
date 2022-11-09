@@ -83,15 +83,15 @@ Conditional and Boolean Operators
 
 * [x] defaultIfEmpty
 * [x] every
-* [x] findIndex // At???
-* [ ] isEmpty // This should be a consumer
+* [x] findIndex
+* [x] isEmpty
 
 Mathematical and Aggregate Operators
 
 * [ ] count
 * [ ] max
 * [ ] min
-* [ ] reduce
+* [x] reduce
 
 Moar
 * [ ] TakeFunc

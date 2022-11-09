@@ -1133,6 +1133,21 @@ func IsEmpty[T any](predicate func(T) bool, cancelParent func()) Operator[T, boo
 // Mathematical and Aggregate Operators //
 //////////////////////////////////////////
 
+func Reduce[I, O any](project func(accum O, in I) O, seed O) Operator[I, O] {
+	return ReduceAcc(func(accum O, in I) (newAccum O, out O) {
+		got := project(accum, in)
+		return got, got
+	}, seed)
+}
+
+func ReduceAcc[I, O, A any](project func(accum A, in I) (newAccum A, out O), seed A) Operator[I, O] {
+	acc := seed
+	return Map(func(in I) (o O) {
+		acc, o = project(acc, in)
+		return o
+	})
+}
+
 /*
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
