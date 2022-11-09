@@ -95,6 +95,7 @@ Mathematical and Aggregate Operators
 * [ ] reduce
 
 Moar
+* [ ] TakeFunc
 * [ ] ApplyAll([]<-chan, operator)[]<-chan
 * [ ] FanOut(<-chan)[]<-chan
 * [ ] FanIn([]<-chan)<-chan
@@ -102,3 +103,10 @@ Moar
 * [ ] Tee
 * [ ] Clone
 * [ ] TapAccum
+* [ ] WithTearDown (accepts a cleanup func)
+* [ ] SampleN
+* [ ] SamplePercent
+* [ ] ParallelMap
+* [ ] ParallelMapStable
+* [ ] Multicast
+* [ ] ScanAccum
