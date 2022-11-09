@@ -1,3 +1,7 @@
+# Raggio (/ˈradʤo/)
+
+Yet another Go channels library.
+
 **DISCLAIMER**: This is not an officially supported Google product.
 
 No, really, this is not.

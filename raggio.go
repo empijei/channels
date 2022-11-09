@@ -49,6 +49,10 @@ TODO: chech that types for emit are D instead of other letters
 TODO: point out
   // error: generic type cannot be alias
 	// MonoTypeOperator[T any] = Operator[T, T]
+
+TODO: express operators in terms of other operators.
+
+TODO: make time related operators get a clock in input
 */
 
 ///////////
@@ -270,7 +274,7 @@ func Partition[T any](condition func(t T) bool) PartitionOperator[T, T, T] {
 	}
 }
 
-func Race[T any](cancels []func()) FanInOperator[T, T] {
+func Race[T any](cancels ...func()) FanInOperator[T, T] {
 	return func(chans []<-chan T) <-chan T {
 		out := make(chan T)
 
@@ -291,13 +295,11 @@ func Race[T any](cancels []func()) FanInOperator[T, T] {
 						firstIteration = false
 						if !arrivedFirst() {
 							// We lost the race, discard input and return.
-							Discard[T]()(c)
-							if len(cancels) != 0 {
-								if len(cancels) != len(chans) {
-									panic("Race: cancels slice len != in chans len")
-								}
-								cancels[i]()
+							var canc func()
+							if len(cancels) > i {
+								canc = cancels[i]
 							}
+							drain(c, canc)
 							return
 						}
 						// We won the race, we are responsible to close the out chan once we are done.
@@ -330,10 +332,7 @@ func Zip[A, B any](cancelA, cancelB func()) ZipOperator[A, B, Pair[A, B]] {
 				case gotA, ok := <-inA:
 					if !ok {
 						// chan A was closed, let's just consume B and end.
-						if cancelB != nil {
-							cancelB()
-						}
-						Discard[B]()(b)
+						drain(b, cancelB)
 						return
 					}
 					// Store the received value
@@ -351,10 +350,7 @@ func Zip[A, B any](cancelA, cancelB func()) ZipOperator[A, B, Pair[A, B]] {
 				case gotB, ok := <-inB:
 					if !ok {
 						// chan B was closed, let's just consume A and end.
-						if cancelA != nil {
-							cancelA()
-						}
-						Discard[A]()(a)
+						drain(a, cancelA)
 						return
 					}
 					// Store the received value
@@ -618,6 +614,24 @@ func Map[I, O any](project func(in I) O) Operator[I, O] {
 	}
 }
 
+func MapCancel[I, O any](project func(in I) (projected O, ok bool), cancelParent func()) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			for v := range in {
+				t, ok := project(v)
+				if !ok {
+					drain(in, cancelParent)
+					return
+				}
+				out <- t
+			}
+		}()
+		return out
+	}
+}
+
 func MergeMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -700,9 +714,8 @@ func SwitchMap[I, O any](ctx context.Context, project func(ctx context.Context, 
 			for {
 				select {
 				case v, ok := <-in:
-					innerCancel()
 					// Ignore inner values in favor of fresher ones.
-					Discard[O]()(inner)
+					drain(inner, innerCancel)
 					if !ok {
 						return
 					}
@@ -908,10 +921,7 @@ func At[T any](index int, cancelParent func()) Operator[T, T] {
 					continue
 				}
 				out <- v
-				if cancelParent != nil {
-					cancelParent()
-				}
-				Discard[T]()(in)
+				drain(in, cancelParent)
 				return
 			}
 		}()
@@ -931,10 +941,7 @@ func AtWithDefault[T any](index int, deflt T, cancelParent func()) Operator[T, T
 					continue
 				}
 				out <- v
-				if cancelParent != nil {
-					cancelParent()
-				}
-				Discard[T]()(in)
+				drain(in, cancelParent)
 				return
 			}
 			out <- deflt
@@ -955,10 +962,7 @@ func Take[T any](count int, cancelParent func()) Operator[T, T] {
 			cur := 0
 			for v := range in {
 				if cur >= count {
-					if cancelParent != nil {
-						cancelParent()
-					}
-					Discard[T]()(in)
+					drain(in, cancelParent)
 					return
 				}
 				out <- v
@@ -1097,20 +1101,133 @@ func StartWith[T any](initial T) Operator[T, T] {
 	}
 }
 
-func WithLatestFrom[I, L any](other <-chan L) Operator[I, Pair[I, L]] {
-	// TODO
-	return nil
+func WithLatestFrom[I, L any](other <-chan L, cancelOther, cancelParent func()) Operator[I, Pair[I, L]] {
+	return func(in <-chan I) <-chan Pair[I, L] {
+		out := make(chan Pair[I, L])
+		go func() {
+			defer close(out)
+			var cur Pair[I, L]
+			otherEmitted := false
+			for {
+				select {
+				case v, ok := <-in:
+					if !ok {
+						drain(other, cancelOther)
+						return
+					}
+					if !otherEmitted {
+						continue
+					}
+					cur.A = v
+					out <- cur
+				case v, ok := <-other:
+					if !ok {
+						drain(in, cancelParent)
+						return
+					}
+					otherEmitted = true
+					cur.B = v
+				}
+			}
+		}()
+		return out
+	}
+}
+
+///////////////////////
+// Utility Operators //
+///////////////////////
+
+func Tap[T any](observer func(T)) Operator[T, T] {
+	return Map[T, T](func(t T) T {
+		observer(t)
+		return t
+	})
+}
+
+func Delay[T any](duration time.Duration) Operator[T, T] {
+	return Tap[T](func(T) { time.Sleep(duration) })
+}
+
+func DelayWhen[T, D any](when <-chan D) Operator[T, T] {
+	return Tap[T](func(T) { <-when })
+}
+
+func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] {
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			expire := time.After(duration)
+			select {
+			case v, ok := <-in:
+				if !ok {
+					return
+				}
+				out <- v
+			case <-expire:
+				drain(in, cancelParent)
+				return
+			}
+			for v := range in {
+				out <- v
+			}
+		}()
+		return out
+	}
 }
 
 /*
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
 
-	out := make(chan T)
-	go func() {
-		defer close(out)
-
-	}()
-	return out
+		}()
+		return out
+	}
 */
+
+///////////////////////////////////////
+// Conditional and Boolean Operators //
+///////////////////////////////////////
+
+func DefaultIfEmpty[T any](deflt T) Operator[T, T] {
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			emitted := false
+			for v := range in {
+				emitted = true
+				out <- v
+			}
+			if !emitted {
+				out <- deflt
+			}
+		}()
+		return out
+	}
+}
+
+func Every[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
+	return func(in <-chan T) <-chan bool {
+		out := make(chan bool)
+		go func() {
+			defer close(out)
+			for v := range in {
+				if ok := predicate(v); ok {
+					continue
+				}
+				drain(in, cancelParent)
+				out <- false
+				return
+			}
+			out <- true
+		}()
+		return out
+	}
+}
 
 /////////////////////////
 // Consuming Operators //
@@ -1159,4 +1276,15 @@ func Combine[I, T, O any](a Operator[I, T], b Operator[T, O]) Operator[I, O] {
 		t := a(in)
 		return b(t)
 	}
+}
+
+///////////
+// Utils //
+///////////
+
+func drain[T any](in <-chan T, cancel func()) {
+	if cancel != nil {
+		cancel()
+	}
+	Discard[T]()(in)
 }

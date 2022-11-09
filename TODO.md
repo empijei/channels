@@ -69,20 +69,20 @@ Join Operators
 * [ ] mergeAll
 * [ ] switchAll
 * [x] startWith
-* [ ] withLatestFrom
+* [x] withLatestFrom
 
 Utility Operators
 
-* [ ] tap
-* [ ] delay
-* [ ] delayWhen
-* [ ] timeout
+* [x] tap
+* [x] delay
+* [x] delayWhen
+* [x] timeout
 * [ ] timeoutWith
 
 Conditional and Boolean Operators
 
-* [ ] defaultIfEmpty
-* [ ] every
+* [x] defaultIfEmpty
+* [x] every
 * [ ] find // Filter+Take(1)?
 * [ ] findIndex // At???
 * [ ] isEmpty // This should be a consumer
@@ -110,3 +110,5 @@ Moar
 * [ ] ParallelMapStable
 * [ ] Multicast
 * [ ] ScanAccum
+* [ ] Lossy (discard when you can't send)
+* [ ] CollectFirst(<-chan T)T
