@@ -8,7 +8,7 @@ Join Creation Operators
 
 * [x] combineLatest
 * [x] concat
-* [ ] forkJoin
+* [x] forkJoin
 * [x] merge
 * [x] partition
 * [x] race
@@ -22,19 +22,13 @@ Transformation Operators
 * [x] bufferToggle
 * [x] concatMap
 * [x] exhaustMap
-* [ ] expand
 * [x] map
 * [x] mergeMap
-* [ ] mergeScan
 * [x] pairwise
 * [x] scan
-* [ ] switchScan
 * [x] switchMap
 * [x] window
-* [ ] windowCount
-* [ ] windowTime
-* [ ] windowToggle
-* [ ] windowWhen
+* [x] windowCount
 
 Filtering Operators
 
@@ -88,9 +82,9 @@ Conditional and Boolean Operators
 
 Mathematical and Aggregate Operators
 
-* [ ] count
-* [ ] max
-* [ ] min
+* [x] count
+* [x] max
+* [x] min
 * [x] reduce
 
 Moar

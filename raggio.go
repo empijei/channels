@@ -16,10 +16,12 @@ package raggio
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
 	"golang.org/x/exp/constraints"
+	"golang.org/x/sync/errgroup"
 )
 
 /*
@@ -234,6 +236,13 @@ func Concat[T any]() Operator[<-chan T, T] {
 			}
 		}()
 		return out
+	}
+}
+
+func ForkJoin[A, B any]() ZipOperator[A, B, Pair[A, B]] {
+	return func(a <-chan A, b <-chan B) <-chan Pair[A, B] {
+		o := CombineLatest[A, B]()(a, b)
+		return Last[Pair[A, B]]()(o)
 	}
 }
 
@@ -645,6 +654,161 @@ func MapFilterCancelTeardown[I, O any](
 	}
 }
 
+func ParallelMap[I, O any](project func(in I) O, count int) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			var wg sync.WaitGroup
+			wg.Add(count)
+			for i := 0; i < count; i++ {
+				go func() {
+					defer wg.Done()
+					for v := range in {
+						o := project(v)
+						out <- o
+					}
+				}()
+			}
+			wg.Wait()
+		}()
+
+		return out
+	}
+}
+
+func ParallelMapCancel[I, O any](project func(context.Context, I) (o O, ok bool), cancelParent func(), count int) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		wg, ctx := errgroup.WithContext(context.Background())
+		out := make(chan O)
+
+		go func() {
+			defer close(out)
+
+			for i := 0; i < count; i++ {
+				for v := range in {
+					wg.Go(func() error {
+						o, ok := project(ctx, v)
+						if !ok {
+							return errors.New("")
+						}
+						select {
+						case out <- o:
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+						return nil
+					})
+				}
+			}
+
+			if err := wg.Wait(); err != nil {
+				drain(in, cancelParent)
+			}
+		}()
+
+		return out
+	}
+}
+
+func ParallelMapStable[I, O any](project func(in I) O, count, maxWindow int) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+
+		go func() {
+			iIn := make(chan Pair[int, I])
+			iOut := make(chan Pair[int, O])
+
+			var tmu sync.RWMutex
+			tch := make(chan struct{})
+			close(tch)
+
+			throttle := func() {
+				tmu.RLock()
+				tch := tch
+				tmu.RUnlock()
+				<-tch
+			}
+
+			checkThrottle := func(wasThrottling bool, windowSize int) (throttling bool) {
+				if !wasThrottling {
+					if windowSize < maxWindow {
+						return false
+					}
+					tmu.Lock()
+					tch = make(chan struct{})
+					tmu.Unlock()
+					return true
+				}
+				if windowSize < maxWindow {
+					tmu.Lock()
+					close(tch)
+					tmu.Unlock()
+					return false
+				}
+				return true
+			}
+
+			// Producer/Throttler
+			go func() {
+				defer close(iIn)
+				c := 0
+				for v := range in {
+					throttle()
+					iIn <- Pair[int, I]{c, v}
+					c++
+				}
+			}()
+
+			// Consumer
+			go func() {
+				defer close(out)
+				window := map[int]O{}
+				cur := 0
+				throttle := false
+				for v := range iOut {
+					if v.A != cur {
+						window[v.A] = v.B
+						throttle = checkThrottle(throttle, len(window))
+						// TODO: check set throttle len(window)
+						continue
+					}
+					out <- v.B
+					for {
+						cur++
+						o, ok := window[cur]
+						if !ok {
+							break
+						}
+						out <- o
+						delete(window, cur)
+						throttle = checkThrottle(throttle, len(window))
+					}
+				}
+				// TODO drain window
+			}()
+
+			// Mappers
+			var wg sync.WaitGroup
+			wg.Add(count)
+			for i := 0; i < count; i++ {
+				go func() {
+					defer wg.Done()
+					for p := range iIn {
+						i, v := p.A, p.B
+						o := project(v)
+						iOut <- Pair[int, O]{i, o}
+					}
+				}()
+			}
+			wg.Wait()
+			close(iOut)
+		}()
+
+		return out
+	}
+}
+
 func MergeMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -767,6 +931,33 @@ func Window[T, D any](emit <-chan D) Operator[T, <-chan T] {
 						return
 					}
 					sent = false
+					close(inner)
+					inner = make(chan T)
+				}
+			}
+		}()
+
+		return out
+	}
+}
+
+func WindowCount[T any](count int) Operator[T, <-chan T] {
+	return func(in <-chan T) <-chan (<-chan T) {
+		out := make(chan (<-chan T))
+		go func() {
+			defer close(out)
+
+			inner := make(chan T)
+			c := 0
+			for v := range in {
+				if c == 0 {
+					out <- inner
+				}
+				c++
+				inner <- v
+				if c >= count {
+					c = 0
+					close(inner)
 					inner = make(chan T)
 				}
 			}
