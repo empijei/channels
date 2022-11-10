@@ -18,6 +18,8 @@ import (
 	"context"
 	"sync"
 	"time"
+
+	"golang.org/x/exp/constraints"
 )
 
 /*
@@ -55,6 +57,8 @@ TODO: express operators in terms of other operators.
 TODO: make time related operators get a clock in input
 
 TODO: say that there is no reduce because we have closures
+
+TODO: check that cancelParent is propagated
 */
 
 ///////////
@@ -413,17 +417,16 @@ func BufferCount[T any](count int) Operator[T, []T] {
 		count = 1
 	}
 	buf := make([]T, 0, count)
-	return MapFilterCancelTeardown(
-		func(in T) (o []T, emit, last bool) {
+	return MapFilterTeardown(
+		func(in T) (o []T, emit bool) {
 			if len(buf) >= count {
 				tmp := buf
 				buf = make([]T, 0, count)
-				return tmp, true, false
+				return tmp, true
 			}
 			buf = append(buf, in)
-			return nil, false, false
+			return nil, false
 		},
-		nil,
 		func() ([]T, bool) {
 			if len(buf) == 0 {
 				return nil, false
@@ -597,6 +600,16 @@ func MapFilterCancel[I, O any](project func(in I) (projected O, shouldEmit, isLa
 		project,
 		cancelParent,
 		nil,
+	)
+}
+
+func MapFilterTeardown[I, O any](project func(in I) (projected O, shouldEmit bool), teardown func() (last O, shouldEmit bool)) Operator[I, O] {
+	return MapFilterCancelTeardown(func(in I) (o O, e, l bool) {
+		o, ok := project(in)
+		return o, ok, false
+	},
+		nil,
+		teardown,
 	)
 }
 
@@ -907,13 +920,12 @@ func IgnoreElements[D any]() Operator[D, struct{}] {
 func Last[T any]() Operator[T, T] {
 	var v T
 	emitted := false
-	return MapFilterCancelTeardown(
-		func(in T) (o T, emit, last bool) {
+	return MapFilterTeardown(
+		func(in T) (o T, emit bool) {
 			v = in
 			emitted = true
-			return in, false, false
+			return in, false
 		},
-		nil,
 		func() (T, bool) {
 			return v, emitted
 		})
@@ -1077,12 +1089,11 @@ func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] 
 
 func DefaultIfEmpty[T any](deflt T) Operator[T, T] {
 	emitted := false
-	return MapFilterCancelTeardown(
-		func(in T) (o T, emit, last bool) {
+	return MapFilterTeardown(
+		func(in T) (o T, emit bool) {
 			emitted = true
-			return in, true, false
+			return in, true
 		},
-		nil,
 		func() (T, bool) {
 			return deflt, !emitted
 		})
@@ -1098,7 +1109,7 @@ func Every[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool]
 			ok = false
 			return false, true, true
 		},
-		nil,
+		cancelParent,
 		func() (bool, bool) {
 			return ok, ok
 		})
@@ -1123,7 +1134,7 @@ func IsEmpty[T any](predicate func(T) bool, cancelParent func()) Operator[T, boo
 
 			return false, true, true
 		},
-		nil,
+		cancelParent,
 		func() (bool, bool) {
 			return !emitted, !emitted
 		})
@@ -1146,6 +1157,65 @@ func ReduceAcc[I, O, A any](project func(accum A, in I) (newAccum A, out O), see
 		acc, o = project(acc, in)
 		return o
 	})
+}
+
+func ReducePreambleAcc[I, O, A any](preamble func(in I) (A, O), project func(accum A, in I) (A, O)) Operator[I, O] {
+	var accum A
+	emitted := false
+	return ReduceAcc(func(accum A, in I) (A, O) {
+		if !emitted {
+			emitted = true
+			return preamble(in)
+		}
+		return project(accum, in)
+	}, accum)
+}
+func ReducePreamble[I, O any](preamble func(in I) O, project func(O, I) O) Operator[I, O] {
+	return ReducePreambleAcc(
+		func(in I) (O, O) {
+			v := preamble(in)
+			return v, v
+		},
+		func(acc O, in I) (O, O) {
+			o := project(acc, in)
+			return o, o
+		},
+	)
+}
+
+func Count[D any]() Operator[D, int] {
+	return Combine(
+		Reduce(func(c int, _ D) int { return c + 1 }, 0),
+		Last[int](),
+	)
+}
+
+func Max[T constraints.Ordered]() Operator[T, T] {
+	return Combine(
+		ReducePreamble(
+			func(i T) T { return i },
+			func(max, i T) T {
+				if max < i {
+					return i
+				}
+				return max
+			}),
+		Last[T](),
+	)
+}
+
+func Min[T constraints.Ordered]() Operator[T, T] {
+	return Combine(
+		ReducePreamble(
+			func(i T) T { return i },
+			func(min, i T) T {
+				if min > i {
+					return i
+				}
+				return min
+			}),
+		Last[T](),
+	)
 }
 
 /*
