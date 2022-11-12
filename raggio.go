@@ -131,7 +131,7 @@ func FromSlice[T any](s []T) SourceOperator[T] {
 	}
 }
 
-func Ticker(duration time.Duration, max int) SourceOperator[time.Time] {
+func FromTicker(c Clock, duration time.Duration, max int) SourceOperator[time.Time] {
 	return func() <-chan time.Time {
 		out := make(chan time.Time)
 		go func() {
@@ -147,7 +147,10 @@ func Ticker(duration time.Duration, max int) SourceOperator[time.Time] {
 	}
 }
 
-func Range(start, end int) SourceOperator[int] {
+func FromRange(start, end int) SourceOperator[int] {
+	if start > end {
+		panic("FromRange: start can't be after end")
+	}
 	return func() <-chan int {
 		out := make(chan int)
 		go func() {
@@ -229,7 +232,6 @@ func Concat[T any]() Operator[<-chan T, T] {
 		go func() {
 			defer close(out)
 			for c := range chans {
-				c := c
 				for v := range c {
 					out <- v
 				}
@@ -249,16 +251,36 @@ func ForkJoin[A, B any]() ZipOperator[A, B, Pair[A, B]] {
 func Merge[T any]() Operator[<-chan T, T] {
 	return func(chans <-chan (<-chan T)) <-chan T {
 		out := make(chan T)
-		for c := range chans {
-			for v := range c {
-				out <- v
+
+		var wg sync.WaitGroup
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range chans {
+				c := c
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for v := range c {
+						out <- v
+					}
+				}()
 			}
-		}
+		}()
+
+		go func() {
+			wg.Wait()
+			close(out)
+		}()
 		return out
 	}
 }
 
 func Partition[T any](condition func(t T) bool) PartitionOperator[T, T, T] {
+	if condition == nil {
+		panic("Partition condition cannot be nil.")
+	}
 	return func(in <-chan T) (then, elze <-chan T) {
 		th := make(chan T)
 		el := make(chan T)
@@ -770,7 +792,6 @@ func ParallelMapStable[I, O any](project func(in I) O, count, maxWindow int) Ope
 					if v.A != cur {
 						window[v.A] = v.B
 						throttle = checkThrottle(throttle, len(window))
-						// TODO: check set throttle len(window)
 						continue
 					}
 					out <- v.B
@@ -785,7 +806,10 @@ func ParallelMapStable[I, O any](project func(in I) O, count, maxWindow int) Ope
 						throttle = checkThrottle(throttle, len(window))
 					}
 				}
-				// TODO drain window
+				for ; len(window) > 0; cur++ {
+					out <- window[cur]
+					delete(window, cur)
+				}
 			}()
 
 			// Mappers
@@ -1442,6 +1466,27 @@ func ToSlice[T any](in <-chan T) []T {
 		res = append(res, v)
 	}
 	return res
+}
+
+func ToSlices[I, L any](i <-chan I, l <-chan L) ([]I, []L) {
+	var ri []I
+	var rl []L
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for vi := range i {
+			ri = append(ri, vi)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for vl := range l {
+			rl = append(rl, vl)
+		}
+	}()
+	wg.Wait()
+	return ri, rl
 }
 
 func Collect[T any](consume func(T) (ok bool), cancelParent func()) SinkOperator[T] {
