@@ -105,3 +105,4 @@ Moar
 * [ ] ScanAccum
 * [ ] Lossy (discard when you can't send)
 * [ ] CollectFirst(<-chan T)T
+* [ ] WithTearDown

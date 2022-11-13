@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jonboulle/clockwork"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/sync/errgroup"
 )
@@ -85,7 +86,7 @@ type (
 	ZipOperator[A, B, O any]       func(<-chan A, <-chan B) <-chan O
 	PartitionOperator[I, O, P any] func(<-chan I) (<-chan O, <-chan P)
 
-	FanInOperator[I, O any] func([]<-chan I) <-chan O
+	FanInOperator[I, O any] func(...<-chan I) <-chan O
 
 	ParallelOperator[I, O any] func([]<-chan I) []<-chan O
 
@@ -101,6 +102,8 @@ type (
 // Creation Operators //
 ////////////////////////
 
+// FromFunc uses the provided generator as a source for data, and emits all values
+// until ok becomes false (the element returned when ok is false is not emitted).
 func FromFunc[T any](generator func(index int) (t T, ok bool)) SourceOperator[T] {
 	return func() <-chan T {
 		out := make(chan T)
@@ -118,6 +121,7 @@ func FromFunc[T any](generator func(index int) (t T, ok bool)) SourceOperator[T]
 	}
 }
 
+// FromSlice emits all values in s and ends.
 func FromSlice[T any](s []T) SourceOperator[T] {
 	return func() <-chan T {
 		out := make(chan T)
@@ -131,22 +135,38 @@ func FromSlice[T any](s []T) SourceOperator[T] {
 	}
 }
 
-func FromTicker(c Clock, duration time.Duration, max int) SourceOperator[time.Time] {
+// FromTicker emits the current time at most max times, separated by a wait of duration.
+// If the context is cancelled it stops.
+func FromTicker(ctx context.Context, c clockwork.Clock, duration time.Duration, max int) SourceOperator[time.Time] {
 	return func() <-chan time.Time {
 		out := make(chan time.Time)
 		go func() {
-			defer close(out)
-			t := time.NewTicker(duration)
+			t := c.NewTicker(duration)
+
 			defer t.Stop()
+			defer close(out)
+
 			for i := 0; i < max; i++ {
-				now := <-t.C
-				out <- now
+				var now time.Time
+
+				select {
+				case now = <-t.Chan():
+				case <-ctx.Done():
+					return
+				}
+
+				select {
+				case out <- now:
+				case <-ctx.Done():
+					return
+				}
 			}
 		}()
 		return out
 	}
 }
 
+// FromRange emits all values between start (included) and end (excluded).
 func FromRange(start, end int) SourceOperator[int] {
 	if start > end {
 		panic("FromRange: start can't be after end")
@@ -167,6 +187,13 @@ func FromRange(start, end int) SourceOperator[int] {
 // Join Creation Operators //
 /////////////////////////////
 
+// CombineLatest emits pairs of the last values emitted by the given inputs.
+//
+// That means that if input a emits twice and input b emits once, the two subsequent
+// emitted pairs will have the same value for B, but different ones for A.
+//
+// Emissions only start after both inputs have emitted at least once, all emissions
+// before then for the input that emitted first are discarded except for the last value.
 func CombineLatest[A, B any]() ZipOperator[A, B, Pair[A, B]] {
 	return func(a <-chan A, b <-chan B) <-chan Pair[A, B] {
 
@@ -226,6 +253,8 @@ func CombineLatest[A, B any]() ZipOperator[A, B, Pair[A, B]] {
 	}
 }
 
+// Concat emits all values from all inner inputs, one after the other, exhausting
+// the previous ones before consuming the next.
 func Concat[T any]() Operator[<-chan T, T] {
 	return func(chans <-chan (<-chan T)) <-chan T {
 		out := make(chan T)
@@ -248,6 +277,8 @@ func ForkJoin[A, B any]() ZipOperator[A, B, Pair[A, B]] {
 	}
 }
 
+// Merge concurrently reads all inner inputs and emits them.
+// Oder is not preserved.
 func Merge[T any]() Operator[<-chan T, T] {
 	return func(chans <-chan (<-chan T)) <-chan T {
 		out := make(chan T)
@@ -277,6 +308,8 @@ func Merge[T any]() Operator[<-chan T, T] {
 	}
 }
 
+// Partition emits values that match the condition on the first output (then)
+// and the values that don't on the second output (elze).
 func Partition[T any](condition func(t T) bool) PartitionOperator[T, T, T] {
 	if condition == nil {
 		panic("Partition condition cannot be nil.")
@@ -300,8 +333,10 @@ func Partition[T any](condition func(t T) bool) PartitionOperator[T, T, T] {
 	}
 }
 
+// Race races the inputs and becomes a clone of the first one that emits,
+// cancelling all the others.
 func Race[T any](cancels ...func()) FanInOperator[T, T] {
-	return func(chans []<-chan T) <-chan T {
+	return func(chans ...<-chan T) <-chan T {
 		out := make(chan T)
 
 		var firstOnce sync.Once
@@ -311,29 +346,42 @@ func Race[T any](cancels ...func()) FanInOperator[T, T] {
 			return isFirst
 		}
 
+		cancelOthers := func(cur int) {
+			// Cancel all other competitors
+			for ci, cancel := range cancels {
+				if ci == cur {
+					// This is the winner, do not cancel
+					continue
+				}
+				cancel()
+			}
+		}
+
 		for i, c := range chans {
 			i := i
 			c := c
 			go func() {
 				firstIteration := true
 				for v := range c {
-					if firstIteration {
-						firstIteration = false
-						if !arrivedFirst() {
-							// We lost the race, discard input and return.
-							var canc func()
-							if len(cancels) > i {
-								canc = cancels[i]
-							}
-							drain(c, canc)
-							return
-						}
-						// We won the race, we are responsible to close the out chan once we are done.
-						defer close(out)
+					if !firstIteration {
+						// We won the race in a previous iteration,
+						// we are responsible to write to the out chan.
+						out <- v
+						continue
 					}
 
-					// We won the race, we are responsible to write to the out chan.
-					out <- v
+					firstIteration = false
+					if arrivedFirst() {
+						// We won the race, we are responsible to close the out chan once we are done.
+						defer close(out)
+						cancelOthers(i)
+						out <- v
+						continue
+					}
+
+					// We lost the race, discard input and return.
+					drain(c, nil) // The winner should have already cancelled us
+					return
 				}
 			}()
 		}
@@ -341,6 +389,17 @@ func Race[T any](cancels ...func()) FanInOperator[T, T] {
 	}
 }
 
+// Zip emits pairs of values from the inputs.
+// Once a value is received, it waits for the other input to emit one before
+// reading more from the same.
+//
+// In other words: every value from both inputs is guaranteed to be emitted
+// exactly once in exactly one pair until one input is closed.
+//
+// If one input is closed, the other is cancelled and discarded.
+//
+// If both inputs have the same length, the second one to be closed might get
+// cancelled right after its last emission, which should be a no-op.
 func Zip[A, B any](cancelA, cancelB func()) ZipOperator[A, B, Pair[A, B]] {
 	return func(a <-chan A, b <-chan B) <-chan Pair[A, B] {
 
@@ -357,6 +416,7 @@ func Zip[A, B any](cancelA, cancelB func()) ZipOperator[A, B, Pair[A, B]] {
 				select {
 				case gotA, ok := <-inA:
 					if !ok {
+						// TODO: only do this if needed
 						// chan A was closed, let's just consume B and end.
 						drain(b, cancelB)
 						return
@@ -403,9 +463,16 @@ func Zip[A, B any](cancelA, cancelB func()) ZipOperator[A, B, Pair[A, B]] {
 // Transformation Operators //
 //////////////////////////////
 
+// Buffer buffers elements from the input until the emitter emits, emitting a
+// slice of the values seen between two emissions (or the start and the first emission).
+//
+// Emitted slices preserve the order of receiving.
+//
+// If the emitter emits when the buffer is empty, nothing is emitted.
+//
+// If the emitter or the input are closed when there are still elements in the buffer,
+// those elements are emitted immediately and the output is closed.
 func Buffer[T, D any](emit <-chan D) Operator[T, []T] {
-	// TODO: how to deal with the fact that we can't use multipe buffers with the
-	// same emit chan?
 	return func(in <-chan T) <-chan []T {
 		out := make(chan []T)
 		go func() {
@@ -443,33 +510,41 @@ func Buffer[T, D any](emit <-chan D) Operator[T, []T] {
 	}
 }
 
+// BufferCount collects elements from the input and emits them in batches of length
+// equal to count.
+// If there are still elements in the buffer when the input is closed, one last,
+// shorter, batch is emitted.
+// Any count value smaller than 1 is treated as 1.
 func BufferCount[T any](count int) Operator[T, []T] {
 	if count <= 0 {
 		count = 1
 	}
-	buf := make([]T, 0, count)
-	return MapFilterTeardown(
-		func(in T) (o []T, emit bool) {
-			if len(buf) >= count {
-				tmp := buf
-				buf = make([]T, 0, count)
-				return tmp, true
+	return func(in <-chan T) <-chan []T {
+		out := make(chan []T)
+		go func() {
+			defer close(out)
+
+			buf := make([]T, 0, count)
+			for v := range in {
+				buf = append(buf, v)
+				if len(buf) >= count {
+					out <- buf
+					buf = make([]T, 0, count)
+				}
 			}
-			buf = append(buf, in)
-			return nil, false
-		},
-		func() ([]T, bool) {
-			if len(buf) == 0 {
-				return nil, false
+			if len(buf) != 0 {
+				out <- buf
 			}
-			return buf, true
-		})
+		}()
+		return out
+	}
 }
 
-func BufferTime[T any](duration time.Duration) Operator[T, []T] {
+// BufferTime is like Buffer, but it uses a ticker to decide when to emit.
+func BufferTime[T any](c clockwork.Clock, duration time.Duration) Operator[T, []T] {
 	return func(in <-chan T) <-chan []T {
-		t := time.NewTicker(duration)
-		emit := t.C
+		t := c.NewTicker(duration)
+		emit := t.Chan()
 		out := make(chan []T)
 		go func() {
 			defer close(out)
@@ -507,6 +582,11 @@ func BufferTime[T any](duration time.Duration) Operator[T, []T] {
 	}
 }
 
+// BufferToggle buffers elements between an emission of openings and an emission of closings.
+// Two consecutive emissions of openings or closings are ignored.
+// If the buffer is open when any of the inputs ends the leftovers are emitted without
+// an emission of closings.
+// Elements between an emission of closings and an emission of openings are ignored.
 func BufferToggle[T, I1, I2 any](openings <-chan I1, closings <-chan I2) Operator[T, []T] {
 	return func(in <-chan T) <-chan []T {
 		out := make(chan []T)
@@ -564,6 +644,14 @@ func ConcatMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 	)
 }
 
+// ExhaustMap project inputs to inner emitters and forwards all inner emissions to
+// the output.
+//
+// If the input emits while an inner emitter is being consumed, the value is discarded.
+// In summary: this operator prioritizes inputs from the projected emitters over the
+// input, making the input lossy.
+//
+// If the opposite behavior is required, use SwitchMap instead.
 func ExhaustMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -607,9 +695,16 @@ func ExhaustMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 }
 
 func Map[I, O any](project func(in I) O) Operator[I, O] {
-	return MapCancel(func(in I) (o O, ok bool) {
-		return project(in), true
-	}, nil)
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			for v := range in {
+				out <- project(v)
+			}
+		}()
+		return out
+	}
 }
 
 func MapFilter[I, O any](project func(in I) (projected O, emit bool)) Operator[I, O] {
@@ -1466,6 +1561,19 @@ func ToSlice[T any](in <-chan T) []T {
 		res = append(res, v)
 	}
 	return res
+}
+
+func ToSliceParallel[T any](in <-chan T) <-chan []T {
+	out := make(chan []T)
+	go func() {
+		defer close(out)
+		var res []T
+		for v := range in {
+			res = append(res, v)
+		}
+		out <- res
+	}()
+	return out
 }
 
 func ToSlices[I, L any](i <-chan I, l <-chan L) ([]I, []L) {

@@ -15,9 +15,15 @@
 package raggio_test
 
 import (
+	"context"
+	"fmt"
+	"runtime"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/jonboulle/clockwork"
 	"golang.org/x/exp/slices"
 
 	. "github.com/empijei/raggio"
@@ -27,6 +33,20 @@ import (
 
 func cmpDiff[T any](a, b T, opts ...cmp.Option) string {
 	return cmp.Diff(a, b, opts...)
+}
+
+func mkSlice(s, e int) []int {
+	var r []int
+	for i := s; i < e; i++ {
+		r = append(r, i)
+	}
+	return r
+}
+
+func flush() {
+	for i := 0; i < runtime.NumCPU()*runtime.NumGoroutine(); i++ {
+		runtime.Gosched()
+	}
 }
 
 func TestFromFunc(t *testing.T) {
@@ -102,6 +122,38 @@ func TestToSlice(t *testing.T) {
 			}
 			close(ch)
 			got := ToSlice(ch)
+			if diff := cmpDiff(tt.s, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestToSliceParallel(t *testing.T) {
+	var tests = []struct {
+		name string
+		s    []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "ten ones",
+			s:    []int{1, 1, 1, 1, 1, 1, 1, 1, 1, 1},
+		},
+		{
+			name: "five entries",
+			s:    []int{0, 1, 2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := make(chan int, len(tt.s))
+			for _, v := range tt.s {
+				ch <- v
+			}
+			close(ch)
+			got := <-ToSliceParallel(ch)
 			if diff := cmpDiff(tt.s, got); diff != "" {
 				t.Errorf("-want +got:\n%s", diff)
 			}
@@ -271,14 +323,6 @@ func TestMerge(t *testing.T) {
 	}
 }
 
-func mkSlice(s, e int) []int {
-	var r []int
-	for i := s; i < e; i++ {
-		r = append(r, i)
-	}
-	return r
-}
-
 func TestPartition(t *testing.T) {
 	var tests = []struct {
 		name  string
@@ -309,6 +353,325 @@ func TestPartition(t *testing.T) {
 			}
 			if diff := cmpDiff(tt.wantE, gotb); diff != "" {
 				t.Errorf("Partition: else: -want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestRace(t *testing.T) {
+
+	var (
+		cna, cnb, cnc bool
+		cta, cca      = context.WithCancel(context.Background())
+		ctb, ccb      = context.WithCancel(context.Background())
+		ctc, ccc      = context.WithCancel(context.Background())
+	)
+	ca := func() { cna = true; cca() }
+	cb := func() { cnb = true; ccb() }
+	cc := func() { cnc = true; ccc() }
+
+	clock := clockwork.NewFakeClock()
+	a := FromTicker(cta, clock, 10*time.Second, 1)()
+	b := FromTicker(ctb, clock, 1*time.Second, 10)() // B should win the race
+	c := FromTicker(ctc, clock, 5*time.Second, 2)()
+
+	ma := Map(func(a time.Time) string { return "a" })(a)
+	mb := Map(func(b time.Time) string { return "b" })(b)
+	mc := Map(func(c time.Time) string { return "c" })(c)
+
+	ch := Race[string](ca, cb, cc)(ma, mb, mc)
+	gotch := ToSliceParallel(ch)
+
+	for i := 0; i < 60; i++ {
+		clock.Advance(1 * time.Second)
+		flush()
+	}
+
+	got := <-gotch
+
+	if cna == false || cnc == false {
+		t.Errorf("Race didn't cancel the ones that lost the race")
+	}
+
+	if cnb {
+		t.Errorf("Race cancelled the winner")
+	}
+
+	if diff := cmpDiff([]string{"b", "b", "b", "b", "b", "b", "b", "b", "b", "b"}, got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+}
+
+func TestZip(t *testing.T) {
+	var tests = []struct {
+		name string
+		a, b []int
+
+		mustCancelA bool
+		mustCancelB bool
+		want        []Pair[int, int]
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "same length",
+			a:    []int{1, 2, 3},
+			b:    []int{2, 4, 6},
+
+			want: []Pair[int, int]{{1, 2}, {2, 4}, {3, 6}},
+		},
+		{
+			name:        "different length",
+			a:           []int{1, 2, 3, 4, 5},
+			b:           []int{2, 4, 6},
+			mustCancelA: true,
+			want:        []Pair[int, int]{{1, 2}, {2, 4}, {3, 6}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+
+			var ca, cb bool
+			fca := func() { ca = true }
+			fcb := func() { cb = true }
+
+			a, b := FromSlice(tt.a)(), FromSlice(tt.b)()
+			gotc := Zip[int, int](fca, fcb)(a, b)
+			got := ToSlice(gotc)
+
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+
+			if tt.mustCancelA && !ca {
+				t.Errorf("Should have cancelled A, but didn't")
+			}
+
+			if tt.mustCancelB && !cb {
+				t.Errorf("Should have cancelled B, but didn't")
+			}
+
+		})
+	}
+}
+
+func TestBuffer(t *testing.T) {
+	emitch := make(chan struct{})
+	emit := func() { emitch <- struct{}{} }
+	buffered := Buffer[int](emitch)
+	in := make(chan int)
+	gotch := ToSliceParallel(buffered(in))
+
+	emit() // Attempt empty emission, should be absorbed.
+	in <- 1
+	in <- 2
+	emit() // [1, 2]
+	emit() // Attempt empty emission, should be absorbed.
+	in <- 1
+	emit() // [1]
+	in <- 1
+	in <- 2
+	in <- 3
+	emit() // [1,2,3]
+	in <- 1
+	close(in) // [1] Leftorvers should be emitted
+
+	got := <-gotch
+
+	want := [][]int{{1, 2}, {1}, {1, 2, 3}, {1}}
+
+	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+
+}
+
+func TestBufferCount(t *testing.T) {
+	var tests = []struct {
+		name string
+		c    int
+		in   []int
+		want [][]int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "exact count",
+			c:    2,
+			in:   []int{1, 2, 3, 4, 5, 6},
+			want: [][]int{{1, 2}, {3, 4}, {5, 6}},
+		},
+		{
+			name: "leftovers 1",
+			c:    2,
+			in:   []int{1, 2, 3, 4, 5, 6, 7},
+			want: [][]int{{1, 2}, {3, 4}, {5, 6}, {7}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			gotch := BufferCount[int](tt.c)(in)
+			got := ToSlice(gotch)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestBufferTime(t *testing.T) {
+	clock := clockwork.NewFakeClock()
+	emit := func() {
+		clock.Advance(1 * time.Second)
+		flush()
+	}
+	buffered := BufferTime[int](clock, 1*time.Second)
+	in := make(chan int)
+	gotch := ToSliceParallel(buffered(in))
+
+	emit() // Attempt empty emission, should be absorbed.
+	in <- 1
+	in <- 2
+	emit() // [1, 2]
+	emit() // Attempt empty emission, should be absorbed.
+	in <- 3
+	emit() // [3]
+	in <- 4
+	in <- 5
+	in <- 6
+	emit() // [4,5,6]
+	in <- 7
+	close(in) // [1] Leftorvers should be emitted
+
+	got := <-gotch
+
+	want := [][]int{{1, 2}, {3}, {4, 5, 6}, {7}}
+
+	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+}
+
+func TestBufferToggle(t *testing.T) {
+	openings := make(chan struct{})
+	open := func() { openings <- struct{}{} }
+	closings := make(chan struct{})
+	clos := func() { closings <- struct{}{} }
+
+	buffered := BufferToggle[int](openings, closings)
+	in := make(chan int)
+	gotch := ToSliceParallel(buffered(in))
+
+	in <- 1 // Discarded
+	in <- 2 // Discarded
+	open()
+	in <- 3
+	in <- 4
+	clos()  // [3, 4]
+	in <- 5 // Discarded
+	open()
+	in <- 6
+	clos() // [6]
+	open()
+	in <- 7
+	close(in) // [7] Leftorvers should be emitted
+
+	got := <-gotch
+
+	want := [][]int{{3, 4}, {6}, {7}}
+
+	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+}
+
+// TODO: TestConcatMap
+
+func TestExhaustMap(t *testing.T) {
+	inners := make(chan (chan string))
+	var mu sync.Mutex
+	var calls []int
+
+	project := func(i int) <-chan string {
+		mu.Lock()
+		calls = append(calls, i)
+		mu.Unlock()
+		return <-inners
+	}
+
+	in := make(chan int)
+	mapped := ExhaustMap(project)
+	gotch := ToSliceParallel(mapped(in))
+
+	{
+		prj := make(chan string)
+		in <- 1       // project(1)
+		inners <- prj // Unblock call to project
+		prj <- "a"    // "a"
+		in <- 2       // Ignored
+		prj <- "b"    // "b"
+		close(prj)    // Re-enable in
+	}
+	flush()
+	{
+		prj := make(chan string)
+		in <- 3       // project(3)
+		inners <- prj // Unblock call to project
+		close(prj)    // Re-enable in
+	}
+	flush()
+	{
+		prj := make(chan string)
+		in <- 4       // project(4)
+		inners <- prj // Unblock call to project
+		prj <- "c"    // "a"
+		prj <- "d"    // "b"
+		close(prj)    // Re-enable in
+	}
+	flush()
+	close(in)
+
+	got := <-gotch
+	want := []string{"a", "b", "c", "d"}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if diff := cmpDiff([]int{1, 3, 4}, calls); diff != "" {
+		t.Errorf("project calls: -want +got:\n%s", diff)
+	}
+
+	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("values: -want +got:\n%s", diff)
+	}
+}
+
+func TestMap(t *testing.T) {
+	var tests = []struct {
+		name string
+		in   []int
+		want []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "non-empty",
+			in:   []int{1, 2, 3},
+			want: []string{"1", "2", "3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			mapped := Map(func(i int) string {
+				return fmt.Sprint(i)
+			})(in)
+			got := ToSlice(mapped)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
 			}
 		})
 	}
