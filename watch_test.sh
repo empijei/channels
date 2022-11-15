@@ -9,7 +9,7 @@ function wait_for_modified(){
   inotifywait --quiet --recursive --event modify,move,create,delete .
 }
 function build(){
-  go test -v -timeout 5s ./... |
+  go test -race -v -timeout 5s ./... |
     sed -e "s/PASS/${GREEN}PASS${NONE}/g" -e "s/FAIL/${RED}FAIL${NONE}/g"
 }
 build

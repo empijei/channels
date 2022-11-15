@@ -20,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jonboulle/clockwork"
 	"golang.org/x/exp/constraints"
 	"golang.org/x/sync/errgroup"
 )
@@ -95,6 +94,12 @@ type (
 		B B
 	}
 
+	Triplet[A, B, C any] struct {
+		A A
+		B B
+		C C
+	}
+
 	Nothing = struct{}
 )
 
@@ -137,11 +142,15 @@ func FromSlice[T any](s []T) SourceOperator[T] {
 
 // FromTicker emits the current time at most max times, separated by a wait of duration.
 // If the context is cancelled it stops.
-func FromTicker(ctx context.Context, c clockwork.Clock, duration time.Duration, max int) SourceOperator[time.Time] {
+// If tickerFactory is nil, the real time is used.
+func FromTicker(ctx context.Context, tickerFactory func(time.Duration) Ticker, duration time.Duration, max int) SourceOperator[time.Time] {
+	if tickerFactory == nil {
+		tickerFactory = NewRealTicker
+	}
 	return func() <-chan time.Time {
 		out := make(chan time.Time)
 		go func() {
-			t := c.NewTicker(duration)
+			t := tickerFactory(duration)
 
 			defer t.Stop()
 			defer close(out)
@@ -541,9 +550,13 @@ func BufferCount[T any](count int) Operator[T, []T] {
 }
 
 // BufferTime is like Buffer, but it uses a ticker to decide when to emit.
-func BufferTime[T any](c clockwork.Clock, duration time.Duration) Operator[T, []T] {
+// If tickerFactory is nil, the real time is used.
+func BufferTime[T any](tickerFactory func(time.Duration) Ticker, duration time.Duration) Operator[T, []T] {
+	if tickerFactory == nil {
+		tickerFactory = NewRealTicker
+	}
 	return func(in <-chan T) <-chan []T {
-		t := c.NewTicker(duration)
+		t := tickerFactory(duration)
 		emit := t.Chan()
 		out := make(chan []T)
 		go func() {
@@ -694,6 +707,7 @@ func ExhaustMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 	}
 }
 
+// Map projects inputs to outputs.
 func Map[I, O any](project func(in I) O) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -707,53 +721,92 @@ func Map[I, O any](project func(in I) O) Operator[I, O] {
 	}
 }
 
+// MapFilter conditionally projects inputs to outputs.
+// If the project func returns false as a second return value, that emission is skipped.
 func MapFilter[I, O any](project func(in I) (projected O, emit bool)) Operator[I, O] {
-	return MapFilterCancel(func(in I) (o O, e, l bool) {
-		o, emit := project(in)
-		return o, emit, false
-	}, nil)
-}
-
-func MapCancel[I, O any](project func(in I) (projected O, ok bool), cancelParent func()) Operator[I, O] {
-	return MapFilterCancel(func(in I) (o O, e, l bool) {
-		o, ok := project(in)
-		return o, true, ok
-	}, cancelParent)
-}
-
-func MapFilterCancel[I, O any](project func(in I) (projected O, shouldEmit, isLast bool), cancelParent func()) Operator[I, O] {
-	return MapFilterCancelTeardown(
-		project,
-		cancelParent,
-		nil,
-	)
-}
-
-func MapFilterTeardown[I, O any](project func(in I) (projected O, shouldEmit bool), teardown func() (last O, shouldEmit bool)) Operator[I, O] {
-	return MapFilterCancelTeardown(func(in I) (o O, e, l bool) {
-		o, ok := project(in)
-		return o, ok, false
-	},
-		nil,
-		teardown,
-	)
-}
-
-func MapFilterCancelTeardown[I, O any](
-	project func(in I) (projected O, shouldEmit, isLast bool),
-	cancelParent func(),
-	teardown func() (lastItem O, shouldEmitLast bool),
-) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 		go func() {
 			defer close(out)
 			for v := range in {
-				t, shouldEmit, isLast := project(v)
-				if shouldEmit {
+				prj, ok := project(v)
+				if !ok {
+					continue
+				}
+				out <- prj
+			}
+		}()
+		return out
+	}
+}
+
+// MapCancel projects inputs to outputs until the first not-ok value is reached,
+// it then cancels the parent and drains the input.
+// The not-ok value returned is discarded.
+func MapCancel[I, O any](project func(in I) (projected O, ok bool), cancelParent func()) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			for v := range in {
+				prj, ok := project(v)
+				if !ok {
+					drain(in, cancelParent)
+					return
+				}
+				out <- prj
+			}
+		}()
+		return out
+	}
+}
+
+// MapFilterCancel conditionally projects inputs to outputs until the first non-ok
+// value is reached, it then cancels the parent and drains the input.
+// It is like a combination of MapFilter and MapCancel.
+func MapFilterCancel[I, O any](project func(in I) (projected O, emit, ok bool), cancelParent func()) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			for v := range in {
+				prj, emit, ok := project(v)
+				if emit {
+					out <- prj
+				}
+				if !ok {
+					drain(in, cancelParent)
+					return
+				}
+			}
+		}()
+		return out
+	}
+}
+
+// MapFilterCancelTeardown conditionally projects inputs to outputs until the last
+// value is reached, it then cancels the parent, drains the input and runs the
+// teardown routine.
+// It is like a combination of MapFilter, MapCancel and Teardown.
+func MapFilterCancelTeardown[I, O any](
+	project func(in I) (projected O, emit, ok bool),
+	cancelParent func(),
+	teardown func(last I, emitted bool) (lastItem O, shouldEmitLast bool),
+) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			var emitted bool
+			var last I
+			for v := range in {
+				emitted = true
+				last = v
+				t, emit, ok := project(v)
+				if emit {
 					out <- t
 				}
-				if isLast {
+				if !ok {
 					drain(in, cancelParent)
 					break
 				}
@@ -761,7 +814,7 @@ func MapFilterCancelTeardown[I, O any](
 			if teardown == nil {
 				return
 			}
-			l, e := teardown()
+			l, e := teardown(last, emitted)
 			if !e {
 				return
 			}
@@ -804,6 +857,7 @@ func ParallelMapCancel[I, O any](project func(context.Context, I) (o O, ok bool)
 
 			for i := 0; i < count; i++ {
 				for v := range in {
+					v := v
 					wg.Go(func() error {
 						o, ok := project(ctx, v)
 						if !ok {
@@ -1124,16 +1178,40 @@ func Audit[T, D any](emit <-chan D) Operator[T, T] {
 }
 
 func Filter[T any](predicate func(T) bool) Operator[T, T] {
-	return MapFilter(func(in T) (o T, emit bool) {
-		return in, predicate(in)
-	})
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			for v := range in {
+				ok := predicate(v)
+				if !ok {
+					continue
+				}
+				out <- v
+			}
+		}()
+		return out
+	}
 }
 
 func FilterCancel[T any](predicate func(T) (emit, last bool), cancelParent func()) Operator[T, T] {
-	return MapFilterCancel(func(in T) (out T, e, l bool) {
-		e, l = predicate(in)
-		return in, e, l
-	}, cancelParent)
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			for v := range in {
+				emit, last := predicate(v)
+				if emit {
+					out <- v
+				}
+				if last {
+					drain(in, cancelParent)
+					return
+				}
+			}
+		}()
+		return out
+	}
 }
 
 func Distinct[T comparable]() Operator[T, T] {
@@ -1228,17 +1306,22 @@ func IgnoreElements[D any]() Operator[D, struct{}] {
 }
 
 func Last[T any]() Operator[T, T] {
-	var v T
-	emitted := false
-	return MapFilterTeardown(
-		func(in T) (o T, emit bool) {
-			v = in
-			emitted = true
-			return in, false
-		},
-		func() (T, bool) {
-			return v, emitted
-		})
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			var emitted bool
+			var last T
+			for v := range in {
+				last = v
+				emitted = true
+			}
+			if emitted {
+				out <- last
+			}
+		}()
+		return out
+	}
 }
 
 func Sample[T, D any](emit <-chan D) Operator[T, T] {
@@ -1393,61 +1476,87 @@ func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] 
 	}
 }
 
+func Teardown[T any](deferred func(last T, emitted bool)) Operator[T, T] {
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			var emitted bool
+			var last T
+			defer func() { deferred(last, emitted) }()
+			for v := range in {
+				last = v
+				emitted = true
+				out <- v
+			}
+		}()
+		return out
+	}
+}
+
 ///////////////////////////////////////
 // Conditional and Boolean Operators //
 ///////////////////////////////////////
 
 func DefaultIfEmpty[T any](deflt T) Operator[T, T] {
-	emitted := false
-	return MapFilterTeardown(
-		func(in T) (o T, emit bool) {
-			emitted = true
-			return in, true
-		},
-		func() (T, bool) {
-			return deflt, !emitted
-		})
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			var emitted bool
+			for v := range in {
+				emitted = true
+				out <- v
+			}
+			if emitted {
+				return
+			}
+			out <- deflt
+		}()
+		return out
+	}
 }
 
 func Every[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
 	ok := true
 	return MapFilterCancelTeardown(
-		func(in T) (o bool, emit, last bool) {
+		func(in T) (o bool, emit, ok bool) {
 			if ok := predicate(in); ok {
-				return true, false, false
+				return true, false, true
 			}
 			ok = false
-			return false, true, true
+			return false, true, false
 		},
 		cancelParent,
-		func() (bool, bool) {
+		func(T, bool) (bool, bool) {
 			return ok, ok
 		})
 }
 
 func FindIndex[T any](predicate func(T) bool, cancelParent func()) Operator[T, int] {
 	count := 0
-	return MapFilterCancel(func(in T) (out int, e, l bool) {
+	return MapFilterCancel(func(in T) (out int, e, ok bool) {
 		if ok := predicate(in); ok {
-			return count, true, true
+			return count, true, false
 		}
 		count++
-		return 0, false, false
+		return 0, false, true
 	}, cancelParent)
 }
 
 func IsEmpty[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
-	emitted := false
-	return MapFilterCancelTeardown(
-		func(in T) (o bool, emit, last bool) {
-			emitted = true
-
-			return false, true, true
-		},
-		cancelParent,
-		func() (bool, bool) {
-			return !emitted, !emitted
-		})
+	return func(in <-chan T) <-chan bool {
+		out := make(chan bool)
+		go func() {
+			defer close(out)
+			var emitted bool
+			for range in {
+				emitted = true
+			}
+			out <- !emitted
+		}()
+		return out
+	}
 }
 
 //////////////////////////////////////////

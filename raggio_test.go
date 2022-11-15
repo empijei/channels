@@ -15,7 +15,6 @@
 package raggio_test
 
 import (
-	"context"
 	"fmt"
 	"runtime"
 	"sync"
@@ -23,9 +22,9 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/jonboulle/clockwork"
 	"golang.org/x/exp/slices"
 
+	"github.com/empijei/raggio"
 	. "github.com/empijei/raggio"
 )
 
@@ -44,10 +43,27 @@ func mkSlice(s, e int) []int {
 }
 
 func flush() {
+	// TODO: this is bad, find a way to not need this.
 	for i := 0; i < runtime.NumCPU()*runtime.NumGoroutine(); i++ {
 		runtime.Gosched()
 	}
+	time.Sleep(1 * time.Millisecond)
 }
+
+type stubTicker chan time.Time
+
+func newStubTickerFactory(t *testing.T, wantDuration time.Duration, s stubTicker) func(time.Duration) raggio.Ticker {
+	return func(d time.Duration) raggio.Ticker {
+		t.Helper()
+		if wantDuration != 0 && wantDuration != d {
+			t.Errorf("TickerFactory: got duration %v want %v", d, wantDuration)
+		}
+		return s
+	}
+}
+func newStubTicker() stubTicker             { return make(chan time.Time) }
+func (stubTicker) Stop()                    {}
+func (s stubTicker) Chan() <-chan time.Time { return s }
 
 func TestFromFunc(t *testing.T) {
 	var tests = []struct {
@@ -362,32 +378,34 @@ func TestRace(t *testing.T) {
 
 	var (
 		cna, cnb, cnc bool
-		cta, cca      = context.WithCancel(context.Background())
-		ctb, ccb      = context.WithCancel(context.Background())
-		ctc, ccc      = context.WithCancel(context.Background())
 	)
-	ca := func() { cna = true; cca() }
-	cb := func() { cnb = true; ccb() }
-	cc := func() { cnc = true; ccc() }
+	ca := func() { cna = true }
+	cb := func() { cnb = true }
+	cc := func() { cnc = true }
 
-	clock := clockwork.NewFakeClock()
-	a := FromTicker(cta, clock, 10*time.Second, 1)()
-	b := FromTicker(ctb, clock, 1*time.Second, 10)() // B should win the race
-	c := FromTicker(ctc, clock, 5*time.Second, 2)()
+	a, b, c := make(chan string), make(chan string), make(chan string)
 
-	ma := Map(func(a time.Time) string { return "a" })(a)
-	mb := Map(func(b time.Time) string { return "b" })(b)
-	mc := Map(func(c time.Time) string { return "c" })(c)
+	ch := Race[string](ca, cb, cc)(a, b, c)
+	var got []string
 
-	ch := Race[string](ca, cb, cc)(ma, mb, mc)
-	gotch := ToSliceParallel(ch)
-
-	for i := 0; i < 60; i++ {
-		clock.Advance(1 * time.Second)
-		flush()
+	b <- "b" // 1: B wins the race
+	got = append(got, <-ch)
+	c <- "c" // Discarded
+	a <- "a" // Discarded
+	b <- "b" // 2
+	got = append(got, <-ch)
+	b <- "b" // 3
+	got = append(got, <-ch)
+	a <- "a" // Discarded
+	c <- "c" // Discarded
+	c <- "c" // Discarded
+	c <- "c" // Discarded
+	close(a)
+	close(b)
+	close(c)
+	for v := range ch {
+		got = append(got, v)
 	}
-
-	got := <-gotch
 
 	if cna == false || cnc == false {
 		t.Errorf("Race didn't cancel the ones that lost the race")
@@ -397,7 +415,7 @@ func TestRace(t *testing.T) {
 		t.Errorf("Race cancelled the winner")
 	}
 
-	if diff := cmpDiff([]string{"b", "b", "b", "b", "b", "b", "b", "b", "b", "b"}, got); diff != "" {
+	if diff := cmpDiff([]string{"b", "b", "b"}, got); diff != "" {
 		t.Errorf("-want +got:\n%s", diff)
 	}
 }
@@ -523,12 +541,14 @@ func TestBufferCount(t *testing.T) {
 }
 
 func TestBufferTime(t *testing.T) {
-	clock := clockwork.NewFakeClock()
+	s := newStubTicker()
+	f := newStubTickerFactory(t, 1*time.Second, s)
+	now := time.Now()
 	emit := func() {
-		clock.Advance(1 * time.Second)
-		flush()
+		now = now.Add(1 * time.Second)
+		s <- now
 	}
-	buffered := BufferTime[int](clock, 1*time.Second)
+	buffered := BufferTime[int](f, 1*time.Second)
 	in := make(chan int)
 	gotch := ToSliceParallel(buffered(in))
 
@@ -615,6 +635,13 @@ func TestExhaustMap(t *testing.T) {
 		prj <- "b"    // "b"
 		close(prj)    // Re-enable in
 	}
+	// TODO: even with this flush, it might happen that the previous "close"
+	// call might not have been picked up.
+	// This means that we could observe different outputs for this test.
+	// For example an output that is *just* the first case is acceptable, as
+	// the following cases might all be discarded if the "close" in the previous
+	// step gets picked up very late.
+	// We need to figure out a way to deflake this and every test that uses flush.
 	flush()
 	{
 		prj := make(chan string)
@@ -670,6 +697,119 @@ func TestMap(t *testing.T) {
 				return fmt.Sprint(i)
 			})(in)
 			got := ToSlice(mapped)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMapFilter(t *testing.T) {
+	var tests = []struct {
+		name string
+		in   []Pair[int, bool]
+		want []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "non-empty",
+			in:   []Pair[int, bool]{{1, true}, {2, false}, {3, true}},
+			want: []string{"1", "3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			mapped := MapFilter(func(i Pair[int, bool]) (string, bool) {
+				return fmt.Sprint(i.A), i.B
+			})(in)
+			got := ToSlice(mapped)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMapCancel(t *testing.T) {
+	var tests = []struct {
+		name       string
+		in         []Pair[int, bool]
+		wantCancel bool
+		want       []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:       "cancelled",
+			in:         []Pair[int, bool]{{1, true}, {2, false}, {3, true}},
+			wantCancel: true,
+			want:       []string{"1"},
+		},
+		{
+			name:       "non-cancelled",
+			in:         []Pair[int, bool]{{1, true}, {2, true}, {3, true}},
+			wantCancel: false,
+			want:       []string{"1", "2", "3"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			var cancelled bool
+			cncl := func() { cancelled = true }
+			mapped := MapCancel(func(i Pair[int, bool]) (string, bool) {
+				return fmt.Sprint(i.A), i.B
+			}, cncl)(in)
+			got := ToSlice(mapped)
+			if cancelled != tt.wantCancel {
+				t.Errorf("cancel: got: %v, want: %v", cancelled, tt.wantCancel)
+			}
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMapFilterCancel(t *testing.T) {
+	var tests = []struct {
+		name       string
+		in         []Triplet[int, bool, bool]
+		wantCancel bool
+		want       []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:       "cancelled",
+			in:         []Triplet[int, bool, bool]{{1, true, true}, {2, false, true}, {3, true, false}, {4, true, true}},
+			wantCancel: true,
+			want:       []string{"1", "3"},
+		},
+		{
+			name:       "non-cancelled",
+			in:         []Triplet[int, bool, bool]{{1, true, true}, {2, false, true}, {3, true, true}, {4, true, true}},
+			wantCancel: false,
+			want:       []string{"1", "3", "4"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			var cancelled bool
+			cncl := func() { cancelled = true }
+			mapped := MapFilterCancel(func(i Triplet[int, bool, bool]) (string, bool, bool) {
+				return fmt.Sprint(i.A), i.B, i.C
+			}, cncl)(in)
+			got := ToSlice(mapped)
+			if cancelled != tt.wantCancel {
+				t.Errorf("cancel: got: %v, want: %v", cancelled, tt.wantCancel)
+			}
 			if diff := cmpDiff(tt.want, got); diff != "" {
 				t.Errorf("-want +got:\n%s", diff)
 			}
