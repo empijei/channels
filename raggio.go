@@ -321,7 +321,7 @@ func Merge[T any]() Operator[<-chan T, T] {
 // and the values that don't on the second output (elze).
 func Partition[T any](condition func(t T) bool) PartitionOperator[T, T, T] {
 	if condition == nil {
-		panic("Partition condition cannot be nil.")
+		panic("Partition: condition cannot be nil.")
 	}
 	return func(in <-chan T) (then, elze <-chan T) {
 		th := make(chan T)
@@ -825,14 +825,19 @@ func MapFilterCancelTeardown[I, O any](
 	}
 }
 
-func ParallelMap[I, O any](project func(in I) O, count int) Operator[I, O] {
+// ParallelMap is like Map but runs the project function in parallel.
+// Output order is not guaranteed to be related to input order.
+func ParallelMap[I, O any](maxParallelism int, project func(in I) O) Operator[I, O] {
+	if maxParallelism == 0 {
+		panic("ParallelMap: maxParallelism must be positive")
+	}
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 		go func() {
 			defer close(out)
 			var wg sync.WaitGroup
-			wg.Add(count)
-			for i := 0; i < count; i++ {
+			wg.Add(maxParallelism)
+			for i := 0; i < maxParallelism; i++ {
 				go func() {
 					defer wg.Done()
 					for v := range in {
@@ -848,7 +853,11 @@ func ParallelMap[I, O any](project func(in I) O, count int) Operator[I, O] {
 	}
 }
 
-func ParallelMapCancel[I, O any](project func(context.Context, I) (o O, ok bool), cancelParent func(), count int) Operator[I, O] {
+// ParallelMapCancel is like ParallelMap, but allows the project function to abort operations.
+func ParallelMapCancel[I, O any](maxParallelism int, project func(context.Context, I) (o O, ok bool), cancelParent func()) Operator[I, O] {
+	if maxParallelism == 0 {
+		panic("ParallelMapCancel: maxParallelism must be positive")
+	}
 	return func(in <-chan I) <-chan O {
 		wg, ctx := errgroup.WithContext(context.Background())
 		out := make(chan O)
@@ -856,7 +865,7 @@ func ParallelMapCancel[I, O any](project func(context.Context, I) (o O, ok bool)
 		go func() {
 			defer close(out)
 
-			for i := 0; i < count; i++ {
+			for i := 0; i < maxParallelism; i++ {
 				for v := range in {
 					v := v
 					wg.Go(func() error {
@@ -883,7 +892,20 @@ func ParallelMapCancel[I, O any](project func(context.Context, I) (o O, ok bool)
 	}
 }
 
-func ParallelMapStable[I, O any](project func(in I) O, count, maxWindow int) Operator[I, O] {
+// ParallelMapStable is like ParallelMap, but it guarantees that the output is
+// in the same order of the input.
+// The maxWindow parameter is used to determine how large the sorting window should be.
+// In other words: if the input at index N is still processing when the item at index
+// N+maxWindow is read, ParallelMapStable will wait for item N to be done processing.
+// Using a maxWindow smaller than maxParallelism is not useful as the maxParallelism will
+// never be achieved.
+func ParallelMapStable[I, O any](maxParallelism, maxWindow int, project func(in I) O) Operator[I, O] {
+	if maxParallelism <= 0 {
+		panic("ParallelMapStable: maxParallelism must be positive")
+	}
+	if maxWindow <= 0 {
+		panic("ParallelMapStable: maxWindow must be positive")
+	}
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 
@@ -905,19 +927,23 @@ func ParallelMapStable[I, O any](project func(in I) O, count, maxWindow int) Ope
 			checkThrottle := func(wasThrottling bool, windowSize int) (throttling bool) {
 				if !wasThrottling {
 					if windowSize < maxWindow {
+						// No throttling.
 						return false
 					}
+					// Start throttling.
 					tmu.Lock()
 					tch = make(chan struct{})
 					tmu.Unlock()
 					return true
 				}
 				if windowSize < maxWindow {
+					// Stop throttling.
 					tmu.Lock()
 					close(tch)
 					tmu.Unlock()
 					return false
 				}
+				// Keep throttling.
 				return true
 			}
 
@@ -964,8 +990,8 @@ func ParallelMapStable[I, O any](project func(in I) O, count, maxWindow int) Ope
 
 			// Mappers
 			var wg sync.WaitGroup
-			wg.Add(count)
-			for i := 0; i < count; i++ {
+			wg.Add(maxParallelism)
+			for i := 0; i < maxParallelism; i++ {
 				go func() {
 					defer wg.Done()
 					for p := range iIn {
@@ -983,7 +1009,14 @@ func ParallelMapStable[I, O any](project func(in I) O, count, maxWindow int) Ope
 	}
 }
 
-func MergeMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
+// MergeMap projects the input emissions to inner emitters that are then merged
+// in the output.
+// Order of the output is not guaranteed to be related to the order of the input.
+func MergeMap[I, O any](maxParallelism int, project func(in I) <-chan O) Operator[I, O] {
+	if maxParallelism <= 0 {
+		panic("MergeMap: maxParallelism must be positive")
+	}
+	semaphore := make(chan struct{}, maxParallelism)
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 
@@ -998,10 +1031,14 @@ func MergeMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 		go func() {
 			defer wg.Done()
 			for v := range in {
+				semaphore <- struct{}{}
 				inner := project(v)
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
+					defer func() {
+						<-semaphore
+					}()
 					for v := range inner {
 						out <- v
 					}
@@ -1013,6 +1050,11 @@ func MergeMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 	}
 }
 
+// PairWise emits couples of subcessive emissions.
+// This means all values are emitted twice, once as the second item of the pair,
+// and then as the first item of the pair (the oldest is the one at index 0, as
+// if it was a sliding window of length 2.
+// The only exceptions are the first and last items, which will only be emitted once.
 func PairWise[T any]() Operator[T, [2]T] {
 	var (
 		buf         [2]T

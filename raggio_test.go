@@ -881,3 +881,123 @@ func TestMapFilterCancelTeardown(t *testing.T) {
 		})
 	}
 }
+
+func TestParallelMap(t *testing.T) {
+	var tests = []struct {
+		name       string
+		start, end int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:  "non-empty",
+			start: 1,
+			end:   100,
+		},
+	}
+	project := func(i int) string {
+		return fmt.Sprint(i)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromRange(tt.start, tt.end)
+			mapped := ParallelMap(10, project)(in())
+			got := ToSlice(mapped)
+			slices.Sort(got)
+			want := ToSlice(Map(project)(in()))
+			slices.Sort(want)
+			if diff := cmpDiff(want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+// TODO: test ParallelMapCancel
+
+func TestParallelStable(t *testing.T) {
+	var tests = []struct {
+		name       string
+		start, end int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:  "non-empty",
+			start: 1,
+			end:   100,
+		},
+	}
+	var struggle bool
+	project := func(i int) string {
+		var a int
+		if struggle {
+			for i := 0; i < 1000; i++ {
+				a = i + a*i
+			}
+		}
+		_ = a
+		return fmt.Sprint(i)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromRange(tt.start, tt.end)
+			runner := func(par, win int) {
+				mapped := ParallelMapStable(par, win, project)(in())
+				got := ToSlice(mapped)
+				want := ToSlice(Map(project)(in()))
+				if diff := cmpDiff(want, got); diff != "" {
+					t.Errorf("-want +got:\n%s", diff)
+				}
+			}
+			struggle = false
+			runner(10, 20)
+			runner(20, 10)
+			runner(1, 1)
+			runner(100, 1)
+			struggle = true
+			runner(10, 20)
+			runner(20, 10)
+			runner(1, 1)
+			runner(100, 1)
+		})
+	}
+}
+
+func TestMergeMap(t *testing.T) {
+
+	// TODO: Test that we actually emit them in a meaningful order
+
+	var tests = []struct {
+		name       string
+		start, end int
+		want       []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:  "four",
+			start: 0,
+			end:   4,
+			want:  []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"},
+		},
+	}
+	project := func(i int) <-chan string {
+		inner := FromRange(i*3+1, i*3+4)()
+		return Map(func(i int) string { return fmt.Sprint(i) })(inner)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := MergeMap(3, project)(FromRange(tt.start, tt.end)())
+			got := ToSlice(ch)
+			slices.Sort(got)
+			slices.Sort(tt.want)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
