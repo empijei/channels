@@ -382,7 +382,7 @@ func Race[T any](cancels ...func()) FanInOperator[T, T] {
 					firstIteration = false
 					if arrivedFirst() {
 						// We won the race, we are responsible to close the out chan once we are done.
-						defer close(out)
+						defer close(out) //nolint:staticcheck // this is intended to run at the end of the function.
 						cancelOthers(i)
 						out <- v
 						continue
@@ -508,6 +508,7 @@ func Buffer[T, D any](emit <-chan D) Operator[T, []T] {
 				case _, ok := <-emit:
 					emitBuf()
 					if !ok {
+						// TODO: drain and cancel input?
 						// Emitter is closed, exit.
 						return
 					}
@@ -1053,7 +1054,8 @@ func SwitchMap[I, O any](ctx context.Context, project func(ctx context.Context, 
 		go func() {
 			defer close(out)
 			var inner <-chan O
-			innerCtx, innerCancel := context.WithCancel(ctx)
+			var innerCtx context.Context
+			var innerCancel func()
 			for {
 				select {
 				case v, ok := <-in:
@@ -1235,10 +1237,7 @@ func DistinctUntilChangedFunc[T any](equals func(T, T) bool) Operator[T, T] {
 		}
 		tmp := prev
 		prev = in
-		if equals(tmp, in) {
-			return false
-		}
-		return true
+		return !equals(tmp, in)
 	})
 }
 

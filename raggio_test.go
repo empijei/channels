@@ -24,7 +24,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/exp/slices"
 
-	"github.com/empijei/raggio"
 	. "github.com/empijei/raggio"
 )
 
@@ -52,8 +51,8 @@ func flush() {
 
 type stubTicker chan time.Time
 
-func newStubTickerFactory(t *testing.T, wantDuration time.Duration, s stubTicker) func(time.Duration) raggio.Ticker {
-	return func(d time.Duration) raggio.Ticker {
+func newStubTickerFactory(t *testing.T, wantDuration time.Duration, s stubTicker) func(time.Duration) Ticker {
+	return func(d time.Duration) Ticker {
 		t.Helper()
 		if wantDuration != 0 && wantDuration != d {
 			t.Errorf("TickerFactory: got duration %v want %v", d, wantDuration)
@@ -812,6 +811,72 @@ func TestMapFilterCancel(t *testing.T) {
 			}
 			if diff := cmpDiff(tt.want, got); diff != "" {
 				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestMapFilterCancelTeardown(t *testing.T) {
+	var tests = []struct {
+		name       string
+		in         []Triplet[int, bool, bool]
+		td         Pair[string, bool]
+		wantLast   int
+		wantCancel bool
+		want       []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:       "cancelled",
+			in:         []Triplet[int, bool, bool]{{1, true, true}, {2, false, true}, {3, true, false}, {4, true, true}},
+			td:         Pair[string, bool]{"5", true},
+			wantLast:   3,
+			wantCancel: true,
+			want:       []string{"1", "3", "5"},
+		},
+		{
+			name:       "non-cancelled",
+			in:         []Triplet[int, bool, bool]{{1, true, true}, {2, false, true}, {3, true, true}, {4, true, true}},
+			td:         Pair[string, bool]{"5", false},
+			wantLast:   4,
+			wantCancel: false,
+			want:       []string{"1", "3", "4"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			var cancelled bool
+			cncl := func() { cancelled = true }
+			var tdE bool
+			mapped := MapFilterCancelTeardown(func(i Triplet[int, bool, bool]) (string, bool, bool) {
+				return fmt.Sprint(i.A), i.B, i.C
+			},
+				cncl,
+				func(l Triplet[int, bool, bool], emitted bool) (string, bool) {
+					tdE = true
+					if got, want := emitted, len(tt.in) != 0; got != want {
+						t.Errorf("teardown emitted: got %v want %v", got, want)
+					}
+					if emitted {
+						if got, want := l.A, tt.wantLast; got != want {
+							t.Errorf("teardown last: got %v want %v", got, want)
+						}
+					}
+					return tt.td.A, tt.td.B
+				},
+			)(in)
+			got := ToSlice(mapped)
+			if cancelled != tt.wantCancel {
+				t.Errorf("cancel: got: %v, want: %v", cancelled, tt.wantCancel)
+			}
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if !tdE {
+				t.Errorf("Teardown did not execute")
 			}
 		})
 	}
