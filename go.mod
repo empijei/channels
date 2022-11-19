@@ -1,4 +1,4 @@
-module github.com/empijei/raggio
+module github.com/empijei/channels
 
 go 1.19
 

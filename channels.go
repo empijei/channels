@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package raggio
+package channels
 
 import (
 	"context"
@@ -1331,6 +1331,19 @@ func Distinct[T comparable]() Operator[T, T] {
 	})
 }
 
+// DistinctKey is like Distinct but it accepts a keyer function to compare elements.
+func DistinctKey[T any, K comparable](keyer func(T any) K) Operator[T, T] {
+	seen := map[K]bool{}
+	return Filter(func(in T) bool {
+		k := keyer(in)
+		if seen[k] {
+			return false
+		}
+		seen[k] = true
+		return true
+	})
+}
+
 // DistinctUntilChangedFunc forwards the input to the output, with the exception
 // of identical consecutive values, which are discarded.
 // In other words this behaves like slices.Compact, but for channels.
@@ -1348,7 +1361,7 @@ func DistinctUntilChangedFunc[T any](equals func(T, T) bool) Operator[T, T] {
 	})
 }
 
-// DistinctUntilKeyChanged is like DistinctUntilChanged but uses a key function to match
+// DistinctUntilKeyChanged is like DistinctUntilChangedFunc but uses a key function to match
 // consecutive values.
 func DistinctUntilKeyChanged[T any, K comparable](key func(T) K) Operator[T, T] {
 	return DistinctUntilChangedFunc(func(a, b T) bool {
@@ -1356,20 +1369,22 @@ func DistinctUntilKeyChanged[T any, K comparable](key func(T) K) Operator[T, T] 
 	})
 }
 
-// TODO: distinct keyer?
-
+// DistinctUntilChanged is like DistinctUntilChangedFunc but it works on comparable items.
 func DistinctUntilChanged[T comparable]() Operator[T, T] {
 	return DistinctUntilChangedFunc(func(a, b T) bool {
 		return a == b
 	})
 }
 
-func DistinctUntilChangedEqualer[T interface{ Equals(T) bool }]() Operator[T, T] {
+// DistinctUntilChangedEqualer is like DistinctUntilChangedFunc, but it compares
+// items that have a Equal(T)bool method on them.
+func DistinctUntilChangedEqualer[T interface{ Equal(T) bool }]() Operator[T, T] {
 	return DistinctUntilChangedFunc(func(a, b T) bool {
-		return a.Equals(b)
+		return a.Equal(b)
 	})
 }
 
+// At emits the item at the provided index (if any) and concludes.
 func At[T any](index int, cancelParent func()) Operator[T, T] {
 	cur := 0
 	return FilterCancel(func(in T) (emit, last bool) {

@@ -12,7 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package raggio implements some channels functions and utilities.
-//
-// This is a toy project, please do not use it.
-package raggio
+// Package channels implements some channels functions and utilities.
+package channels

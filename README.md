@@ -1,4 +1,4 @@
-# Raggio (/ˈradʤo/)
+# Channels
 
 Yet another Go channels library.
 
@@ -7,11 +7,6 @@ Yet another Go channels library.
 No, really, this is not.
 
 This is code that *happens* to be owned by Google for legal reasons.
-
-This doesn't even follow code readability good practices and it wastes a massive
-amount of resources.
-
-It's a toy project, please don't use.
 
 # But what is this, really
 
@@ -24,5 +19,8 @@ operators to all work in parallel.
 This works basically like a bash pipeline, with channels as the pipes and funcs
 as programs.
 
-This is, of course, super wasteful as every operator creates at least one goroutine,
-but I wanted to experiment with the concept of reactive Go.
+Note that every operator creates at least one goroutine, so it might not be the most
+efficient solution out there, but I wanted to experiment with the concept.
+
+We have `slices` and `maps` packages in the stdlib, seemed appropriate to try an
+make a `channels` one.

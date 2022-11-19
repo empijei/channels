@@ -1,4 +1,4 @@
-package raggio
+package channels
 
 import "time"
 

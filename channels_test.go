@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package raggio_test
+package channels_test
 
 import (
 	"context"
@@ -25,7 +25,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/exp/slices"
 
-	. "github.com/empijei/raggio"
+	. "github.com/empijei/channels"
 )
 
 // TODO: find a way to check for goroutine leaks.
@@ -1186,9 +1186,7 @@ func TestSwitchMap(t *testing.T) {
 		ctx0 := innerCtx
 		in <- 3 // This should cancel the context, discard prj0, create a new one and abort inner emission
 		// Wait for cancellation
-		select {
-		case <-ctx0.Done():
-		}
+		<-ctx0.Done()
 		prj0 <- "ignored"
 		close(prj0) // conclude inner
 
@@ -1207,9 +1205,7 @@ func TestSwitchMap(t *testing.T) {
 			t.Errorf("After new emission: cancelled: got true, want false")
 		}
 		// Wait for cancellation
-		select {
-		case <-ctx1.Done():
-		}
+		<-ctx1.Done()
 		prj2 <- "e"
 		close(prj2) // conclude inner
 	}
@@ -1386,6 +1382,7 @@ func TestFilterCancel(t *testing.T) {
 		}
 	})
 	t.Run("cancel", func(t *testing.T) {
+		var mu sync.Mutex
 		var gotCancel bool
 		var last bool
 		in := make(chan int)
@@ -1395,13 +1392,17 @@ func TestFilterCancel(t *testing.T) {
 			close(done)
 		}
 		flt := FilterCancel(func(i int) (e bool, l bool) {
+			mu.Lock()
+			defer mu.Unlock()
 			return i%2 != 0, last
 		}, cncl)(in)
 		got := ToSliceParallel(flt)
 		in <- 0
 		in <- 1
 		in <- 2
+		mu.Lock()
 		last = true
+		mu.Unlock()
 		in <- 3
 		<-done
 		in <- 4 //ignored
@@ -1472,6 +1473,57 @@ func TestDistinctUntilChanged(t *testing.T) {
 			got := ToSlice(flt)
 			if diff := cmpDiff(tt.want, got); diff != "" {
 				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAt(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name  string
+		in    []int
+		index int
+		want  []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:  "empty, nonzero index",
+			index: 10,
+		},
+		{
+			name:  "last",
+			index: 5,
+			in:    []int{0, 1, 2, 3, 4},
+			want:  []int{4},
+		},
+		{
+			name:  "too short",
+			index: 5,
+			in:    []int{0, 1, 2, 3},
+			want:  []int{},
+		},
+		{
+			name:  "in the middle",
+			index: 5,
+			in:    []int{0, 1, 2, 3, 4, 5, 67, 8, 9, 10},
+			want:  []int{4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cancelled bool
+			cncl := func() { cancelled = true }
+			in := FromSlice(tt.in)()
+			flt := At[int](tt.index, cncl)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if len(tt.want) != 0 != cancelled {
+				t.Errorf("cancelled: got %v want %v", cancelled, len(tt.want) != 0)
 			}
 		})
 	}
