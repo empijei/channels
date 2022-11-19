@@ -61,6 +61,8 @@ TODO: make time related operators get a clock in input
 TODO: say that there is no reduce because we have closures
 
 TODO: check that cancelParent is propagated
+
+TODO: document that reusing a constructor might have unexpected results (e.g. distinct filters also stuff from previous runs).
 */
 
 ///////////
@@ -665,7 +667,7 @@ func ConcatMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 // In summary: this operator prioritizes inputs from the projected emitters over the
 // input, making the input lossy.
 //
-// If the opposite behavior is required, use SwitchMap instead.
+// This is like SwitchMap, but the inner emitters are prioritized.
 func ExhaustMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -691,6 +693,7 @@ func ExhaustMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
 					inner = project(v)
 				case v, ok := <-inner:
 					if !ok {
+						// TODO add a spy here to deflake test?
 						if in == nil {
 							// We are done.
 							return
@@ -1072,14 +1075,18 @@ func PairWise[T any]() Operator[T, [2]T] {
 	})
 }
 
+// Scan is like Map, but the project function is called with the the last
+// value emitted and the current value from the input.
+// The first iteraion will be called with seed.
 func Scan[I, O any](project func(accum O, cur I) O, seed O) Operator[I, O] {
-	accum := seed
-	return Map(func(i I) O {
-		accum = project(accum, i)
-		return accum
-	})
+	return ScanAccum(func(prevAcc O, i I) (acc O, v O) {
+		acc = project(prevAcc, i)
+		return acc, acc
+	}, seed)
 }
 
+// ScanAccum is like Scan, but the accumulator is kept separate from the return
+// value, and they can be of different types.
 func ScanAccum[I, O, A any](project func(accum A, cur I) (nextAccum A, o O), seed A) Operator[I, O] {
 	accum := seed
 	return Map(func(i I) O {
@@ -1089,6 +1096,26 @@ func ScanAccum[I, O, A any](project func(accum A, cur I) (nextAccum A, o O), see
 	})
 }
 
+// ScanPreamble is like ScanAccum, but instead of taking a seed value it computes
+// the seed and the first emission by calling seedFn func on the first input value.
+func ScanPreamble[I, O, A any](project func(accum A, in I) (A, O), seedFn func(in I) (A, O)) Operator[I, O] {
+	var accum A
+	emitted := false
+	return ScanAccum(func(accum A, in I) (A, O) {
+		if !emitted {
+			emitted = true
+			return seedFn(in)
+		}
+		return project(accum, in)
+	}, accum /*ignored*/)
+}
+
+// SwitchMap projects the inputs to inner emitters and copies them to the output
+// until the input emits a new value.
+// When a new input value comes in, the last inner emitter's context is cancelled
+// and its values are discarded in favor of the ones emitted by the most recent
+// inner emitter.
+// This is like ExhaustMap but the input is prioritized.
 func SwitchMap[I, O any](ctx context.Context, project func(ctx context.Context, in I) <-chan O) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -1123,6 +1150,14 @@ func SwitchMap[I, O any](ctx context.Context, project func(ctx context.Context, 
 	}
 }
 
+// Window maps the input to a series of emitters that just copy the input values.
+// Every time emit emits a new inner emitter that copies the input values is emitted.
+//
+// In other words this is like buffer, but instead of emitting slices of values
+// it emits emitters of these values.
+//
+// Consecutive emissions that emit no values do not cause empty emitters to be
+// generated.
 func Window[T, D any](emit <-chan D) Operator[T, <-chan T] {
 	return func(in <-chan T) <-chan (<-chan T) {
 		out := make(chan (<-chan T))
@@ -1131,6 +1166,11 @@ func Window[T, D any](emit <-chan D) Operator[T, <-chan T] {
 
 			inner := make(chan T)
 			sent := false
+			defer func() {
+				if inner != nil {
+					close(inner)
+				}
+			}()
 
 			for {
 				select {
@@ -1147,9 +1187,12 @@ func Window[T, D any](emit <-chan D) Operator[T, <-chan T] {
 					if !ok {
 						return
 					}
-					sent = false
+					if !sent {
+						continue
+					}
 					close(inner)
 					inner = make(chan T)
+					sent = false
 				}
 			}
 		}()
@@ -1158,6 +1201,9 @@ func Window[T, D any](emit <-chan D) Operator[T, <-chan T] {
 	}
 }
 
+// WindowCount is like Window but it starts a new inner emitter every count emissions
+// received from the input.
+// The last inner emitter might emit less than count items.
 func WindowCount[T any](count int) Operator[T, <-chan T] {
 	return func(in <-chan T) <-chan (<-chan T) {
 		out := make(chan (<-chan T))
@@ -1165,6 +1211,11 @@ func WindowCount[T any](count int) Operator[T, <-chan T] {
 			defer close(out)
 
 			inner := make(chan T)
+			defer func() {
+				if inner != nil {
+					close(inner)
+				}
+			}()
 			c := 0
 			for v := range in {
 				if c == 0 {
@@ -1188,6 +1239,12 @@ func WindowCount[T any](count int) Operator[T, <-chan T] {
 // Filtering Operators //
 /////////////////////////
 
+// Audit can be used to observe the last emitted value for the input emitter.
+// When emit emits, the most recent value for the input will be forwarded to the output.
+//
+// Note that this might cause repeated items to be emitted, for example if emit
+// fires twice between input emissions.
+// If this behavior is not desired, please use Sample instead.
 func Audit[T, D any](emit <-chan D) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
@@ -1208,9 +1265,7 @@ func Audit[T, D any](emit <-chan D) Operator[T, T] {
 					}
 				case v, ok := <-in:
 					if !ok {
-						// Disable this case
-						in = nil
-						continue
+						return
 					}
 					t = v
 					readOnce = true
@@ -1221,6 +1276,8 @@ func Audit[T, D any](emit <-chan D) Operator[T, T] {
 	}
 }
 
+// Filter conditionally forwards inputs to the output.
+// Values that the predicate returns true for are forwarded.
 func Filter[T any](predicate func(T) bool) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
@@ -1238,6 +1295,8 @@ func Filter[T any](predicate func(T) bool) Operator[T, T] {
 	}
 }
 
+// FilterCancel is like filter, but it can report when the last emission happens,
+// which will cause the output channel to be closed and the input to be drained.
 func FilterCancel[T any](predicate func(T) (emit, last bool), cancelParent func()) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
@@ -1258,6 +1317,9 @@ func FilterCancel[T any](predicate func(T) (emit, last bool), cancelParent func(
 	}
 }
 
+// Distinct forwards the input to the output for values that have not been seen yet.
+// Note: this needs to keep a set of all seen values in memory, so it might use
+// a lot of memory.
 func Distinct[T comparable]() Operator[T, T] {
 	seen := map[T]bool{}
 	return Filter(func(in T) bool {
@@ -1269,6 +1331,9 @@ func Distinct[T comparable]() Operator[T, T] {
 	})
 }
 
+// DistinctUntilChangedFunc forwards the input to the output, with the exception
+// of identical consecutive values, which are discarded.
+// In other words this behaves like slices.Compact, but for channels.
 func DistinctUntilChangedFunc[T any](equals func(T, T) bool) Operator[T, T] {
 	first := true
 	var prev T
@@ -1283,11 +1348,15 @@ func DistinctUntilChangedFunc[T any](equals func(T, T) bool) Operator[T, T] {
 	})
 }
 
-func DistinctKeyer[T any, K comparable](key func(T) K) Operator[T, T] {
+// DistinctUntilKeyChanged is like DistinctUntilChanged but uses a key function to match
+// consecutive values.
+func DistinctUntilKeyChanged[T any, K comparable](key func(T) K) Operator[T, T] {
 	return DistinctUntilChangedFunc(func(a, b T) bool {
 		return key(a) == key(b)
 	})
 }
+
+// TODO: distinct keyer?
 
 func DistinctUntilChanged[T comparable]() Operator[T, T] {
 	return DistinctUntilChangedFunc(func(a, b T) bool {
@@ -1605,6 +1674,8 @@ func IsEmpty[T any](predicate func(T) bool, cancelParent func()) Operator[T, boo
 //////////////////////////////////////////
 
 func Reduce[I, O any](project func(accum O, in I) O, seed O) Operator[I, O] {
+	// TODO: this is wrong, this is not Reduce, this is Scan.
+	// Reduce should only emit once at the end.
 	return ReduceAcc(func(accum O, in I) (newAccum O, out O) {
 		got := project(accum, in)
 		return got, got

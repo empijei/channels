@@ -15,6 +15,7 @@
 package raggio_test
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"sync"
@@ -26,6 +27,16 @@ import (
 
 	. "github.com/empijei/raggio"
 )
+
+// TODO: find a way to check for goroutine leaks.
+
+const parall = true
+
+func parallel(t *testing.T) {
+	if parall {
+		t.Parallel()
+	}
+}
 
 // TODO(clap): use this instead of cmp.Diff
 
@@ -65,6 +76,7 @@ func (stubTicker) Stop()                    {}
 func (s stubTicker) Chan() <-chan time.Time { return s }
 
 func TestFromFunc(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		in   func(i int) (int, bool)
@@ -113,6 +125,7 @@ func TestFromFunc(t *testing.T) {
 }
 
 func TestToSlice(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		s    []int
@@ -145,6 +158,7 @@ func TestToSlice(t *testing.T) {
 }
 
 func TestToSliceParallel(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		s    []int
@@ -177,6 +191,7 @@ func TestToSliceParallel(t *testing.T) {
 }
 
 func TestToSlices(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		a, b []int
@@ -205,6 +220,7 @@ func TestToSlices(t *testing.T) {
 }
 
 func TestFromSlice(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		s    []int
@@ -238,6 +254,7 @@ func TestFromSlice(t *testing.T) {
 // TODO TestFromTicker
 
 func TestFromRange(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		s, e int
@@ -273,6 +290,7 @@ func TestFromRange(t *testing.T) {
 // TODO CombineLatest
 
 func TestConcat(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		in   [][]int
@@ -305,6 +323,7 @@ func TestConcat(t *testing.T) {
 // TODO ForkJoin
 
 func TestMerge(t *testing.T) {
+	parallel(t)
 
 	// TODO: Test that we actually emit them in a meaningful order
 
@@ -339,6 +358,7 @@ func TestMerge(t *testing.T) {
 }
 
 func TestPartition(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name  string
 		in    []int
@@ -374,6 +394,7 @@ func TestPartition(t *testing.T) {
 }
 
 func TestRace(t *testing.T) {
+	parallel(t)
 
 	var (
 		cna, cnb, cnc bool
@@ -420,6 +441,7 @@ func TestRace(t *testing.T) {
 }
 
 func TestZip(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		a, b []int
@@ -474,6 +496,7 @@ func TestZip(t *testing.T) {
 }
 
 func TestBuffer(t *testing.T) {
+	parallel(t)
 	emitch := make(chan struct{})
 	emit := func() { emitch <- struct{}{} }
 	buffered := Buffer[int](emitch)
@@ -505,6 +528,7 @@ func TestBuffer(t *testing.T) {
 }
 
 func TestBufferCount(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		c    int
@@ -540,6 +564,7 @@ func TestBufferCount(t *testing.T) {
 }
 
 func TestBufferTime(t *testing.T) {
+	parallel(t)
 	s := newStubTicker()
 	f := newStubTickerFactory(t, 1*time.Second, s)
 	now := time.Now()
@@ -575,6 +600,7 @@ func TestBufferTime(t *testing.T) {
 }
 
 func TestBufferToggle(t *testing.T) {
+	parallel(t)
 	openings := make(chan struct{})
 	open := func() { openings <- struct{}{} }
 	closings := make(chan struct{})
@@ -610,6 +636,7 @@ func TestBufferToggle(t *testing.T) {
 // TODO: TestConcatMap
 
 func TestExhaustMap(t *testing.T) {
+	parallel(t)
 	inners := make(chan (chan string))
 	var mu sync.Mutex
 	var calls []int
@@ -675,6 +702,7 @@ func TestExhaustMap(t *testing.T) {
 }
 
 func TestMap(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		in   []int
@@ -704,6 +732,7 @@ func TestMap(t *testing.T) {
 }
 
 func TestMapFilter(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		in   []Pair[int, bool]
@@ -733,6 +762,7 @@ func TestMapFilter(t *testing.T) {
 }
 
 func TestMapCancel(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name       string
 		in         []Pair[int, bool]
@@ -775,6 +805,7 @@ func TestMapCancel(t *testing.T) {
 }
 
 func TestMapFilterCancel(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name       string
 		in         []Triplet[int, bool, bool]
@@ -817,6 +848,7 @@ func TestMapFilterCancel(t *testing.T) {
 }
 
 func TestMapFilterCancelTeardown(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name       string
 		in         []Triplet[int, bool, bool]
@@ -883,6 +915,7 @@ func TestMapFilterCancelTeardown(t *testing.T) {
 }
 
 func TestParallelMap(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name       string
 		start, end int
@@ -917,6 +950,7 @@ func TestParallelMap(t *testing.T) {
 // TODO: test ParallelMapCancel
 
 func TestParallelStable(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name       string
 		start, end int
@@ -967,9 +1001,7 @@ func TestParallelStable(t *testing.T) {
 }
 
 func TestMergeMap(t *testing.T) {
-
-	// TODO: Test that we actually emit them in a meaningful order
-
+	parallel(t)
 	var tests = []struct {
 		name       string
 		start, end int
@@ -995,6 +1027,449 @@ func TestMergeMap(t *testing.T) {
 			got := ToSlice(ch)
 			slices.Sort(got)
 			slices.Sort(tt.want)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestPairWise(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name string
+		in   []int
+		want [][2]int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "three",
+			in:   []int{1, 2, 3, 4},
+			want: [][2]int{{1, 2}, {2, 3}, {3, 4}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ToSlice(PairWise[int]()(FromSlice(tt.in)()))
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestScan(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name string
+		seed int
+		in   []int
+		want []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "four",
+			in:   []int{1, 2, 3, 4},
+			want: []int{1, 3, 6, 10},
+		},
+		{
+			name: "with seed",
+			seed: 1,
+			in:   []int{2, 3, 4},
+			want: []int{3, 6, 10},
+		},
+	}
+
+	project := func(acc, i int) int {
+		return acc + i
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ToSlice(Scan(project, tt.seed)(FromSlice(tt.in)()))
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestScanPreamble(t *testing.T) {
+	parallel(t)
+	project := func(acc, i int) (int, int) {
+		return acc + i, acc + i
+	}
+
+	var tests = []struct {
+		name   string
+		seedFn func(int) (int, int)
+		in     []int
+		want   []int
+	}{
+		{
+			name:   "four",
+			seedFn: func(i int) (int, int) { return project(4, i) },
+			in:     []int{1, 2, 3, 4},
+			want:   []int{5, 7, 10, 14},
+		},
+		{
+			name:   "first is seed",
+			seedFn: func(i int) (int, int) { return project(i, i) },
+			in:     []int{1, 2, 3},
+			want:   []int{2, 4, 7},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ToSlice(ScanPreamble(project, tt.seedFn)(FromSlice(tt.in)()))
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSwitchMap(t *testing.T) {
+	parallel(t)
+	inners := make(chan (chan string))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	var mu sync.Mutex
+	var calls []int
+	var innerCtx context.Context
+
+	cancelled := func() bool {
+		select {
+		case <-innerCtx.Done():
+			return true
+		default:
+			return false
+		}
+	}
+
+	project := func(ctx context.Context, i int) <-chan string {
+		mu.Lock()
+		calls = append(calls, i)
+		innerCtx = ctx
+		mu.Unlock()
+		return <-inners
+	}
+
+	in := make(chan int)
+	mapped := SwitchMap(ctx, project)
+	gotch := ToSliceParallel(mapped(in))
+
+	{
+		prj := make(chan string)
+		in <- 1       // project(1)
+		inners <- prj // Unblock call to project
+		prj <- "a"    // "a"
+		prj <- "b"    // "b"
+		close(prj)    // conclude
+		if cancelled() {
+			t.Errorf("After inner exhaustion: cancelled: got true, want false")
+		}
+	}
+	{
+		prj0 := make(chan string)
+		in <- 2
+		inners <- prj0
+		prj0 <- "c"
+		prj0 <- "d"
+		ctx0 := innerCtx
+		in <- 3 // This should cancel the context, discard prj0, create a new one and abort inner emission
+		// Wait for cancellation
+		select {
+		case <-ctx0.Done():
+		}
+		prj0 <- "ignored"
+		close(prj0) // conclude inner
+
+		prj1 := make(chan string)
+		inners <- prj1 // Unblock call to project.
+		if cancelled() {
+			t.Errorf("After new emission: cancelled: got true, want false")
+		}
+		ctx1 := innerCtx
+		// No emissions
+		in <- 4 // Discard prj1
+		prj2 := make(chan string)
+		inners <- prj2 // Unblock call to project.
+		close(prj1)
+		if cancelled() {
+			t.Errorf("After new emission: cancelled: got true, want false")
+		}
+		// Wait for cancellation
+		select {
+		case <-ctx1.Done():
+		}
+		prj2 <- "e"
+		close(prj2) // conclude inner
+	}
+	close(in)
+
+	got := <-gotch
+	want := []string{"a", "b", "c", "d", "e"}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if diff := cmpDiff([]int{1, 2, 3, 4}, calls); diff != "" {
+		t.Errorf("project calls: -want +got:\n%s", diff)
+	}
+
+	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("values: -want +got:\n%s", diff)
+	}
+}
+
+func TestWindow(t *testing.T) {
+	parallel(t)
+	in := make(chan int)
+	emitCh := make(chan struct{})
+	done := make(chan struct{})
+	emit := func() { emitCh <- struct{}{} }
+
+	ws := Window[int](emitCh)(in)
+
+	var got [][]int
+	go func() {
+		defer close(done)
+		for w := range ws {
+			var inner []int
+			for v := range w {
+				inner = append(inner, v)
+			}
+			got = append(got, inner)
+		}
+	}()
+
+	in <- 1
+	in <- 2
+	emit()
+	in <- 3
+	in <- 4
+	emit()
+	emit()
+	in <- 5
+	close(in)
+	<-done
+	want := [][]int{{1, 2}, {3, 4} /* discard empty*/, {5}}
+
+	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("values: -want +got:\n%s", diff)
+	}
+}
+
+func TestWindowCount(t *testing.T) {
+	parallel(t)
+
+	var tests = []struct {
+		name string
+		s, e int
+		want [][]int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "exact dividend",
+			s:    0,
+			e:    9,
+			want: [][]int{{0, 1, 2}, {3, 4, 5}, {6, 7, 8}},
+		},
+		{
+			name: "leftovers",
+			s:    0,
+			e:    11,
+			want: [][]int{{0, 1, 2}, {3, 4, 5}, {6, 7, 8}, {9, 10}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromRange(tt.s, tt.e)
+			ws := WindowCount[int](3)(in())
+			var got [][]int
+			for w := range ws {
+				g := ToSlice(w)
+				got = append(got, g)
+			}
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestAudit(t *testing.T) {
+	in := make(chan int)
+	emitCh := make(chan struct{})
+	au := Audit[int](emitCh)(in)
+
+	c := 0
+	obs := func(want int) {
+		t.Helper()
+		emitCh <- struct{}{}
+		got := <-au
+		c++
+		if got != want {
+			t.Errorf("audited[%v]: got %v want %v", c, got, want)
+		}
+	}
+
+	emitCh <- struct{}{} // This should not emit because we don't have an initial value
+	in <- 1
+	obs(1)
+	in <- 2
+	obs(2)
+	obs(2)
+	in <- 3
+	in <- 4
+	obs(4)
+	close(in)
+	for range au {
+	} // Make sure we close the output
+}
+
+func TestFilter(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name string
+		in   []int
+		want []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "non-empty",
+			in:   []int{0, 1, 2, 3, 4},
+			want: []int{1, 3},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			flt := Filter(func(i int) bool {
+				return i%2 != 0
+			})(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFilterCancel(t *testing.T) {
+	parallel(t)
+	t.Run("no cancel", func(t *testing.T) {
+		in := FromRange(0, 6)()
+		var gotCancel bool
+		cncl := func() { gotCancel = true }
+		flt := FilterCancel(func(i int) (e bool, l bool) {
+			return i%2 != 0, false
+		}, cncl)(in)
+		got := ToSlice(flt)
+		if diff := cmpDiff([]int{1, 3, 5}, got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if gotCancel {
+			t.Errorf("got unwanted cancel")
+		}
+	})
+	t.Run("cancel", func(t *testing.T) {
+		var gotCancel bool
+		var last bool
+		in := make(chan int)
+		done := make(chan struct{})
+		cncl := func() {
+			gotCancel = true
+			close(done)
+		}
+		flt := FilterCancel(func(i int) (e bool, l bool) {
+			return i%2 != 0, last
+		}, cncl)(in)
+		got := ToSliceParallel(flt)
+		in <- 0
+		in <- 1
+		in <- 2
+		last = true
+		in <- 3
+		<-done
+		in <- 4 //ignored
+		in <- 5 //ignored
+		// Make sure we already closed the output
+		<-flt
+		in <- 6 //ignored
+		in <- 7 //ignored
+		close(in)
+
+		if diff := cmpDiff([]int{1, 3}, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if !gotCancel {
+			t.Errorf("didn't get wanted cancel")
+		}
+	})
+}
+
+func TestDistinct(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name string
+		in   []int
+		want []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "non-empty",
+			in:   []int{0, 1, 2, 2, 3, 1, 4},
+			want: []int{0, 1, 2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			flt := Distinct[int]()(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestDistinctUntilChanged(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name string
+		in   []int
+		want []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "non-empty",
+			in:   []int{0, 1, 2, 2, 3, 1, 1, 4},
+			want: []int{0, 1, 2, 3, 1, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			flt := DistinctUntilChanged[int]()(in)
+			got := ToSlice(flt)
 			if diff := cmpDiff(tt.want, got); diff != "" {
 				t.Errorf("-want +got:\n%s", diff)
 			}
