@@ -28,6 +28,12 @@ import (
 TODO: point this out
 type declarations inside generic functions are not currently supported
 
+TODO: make ops that take an emitter also take a cancelParent that gets called when
+emit is closed, and drain input.
+
+TODO: make sure that wording like "forwards", "becomes a copy" etc. are consistently
+used and well defined in the doc.
+
 type outT = struct {
 a A
 b B
@@ -38,7 +44,14 @@ and cancel them once they get discarded (e.g. for switchmap)
 
 TODO: check for if statements for first or similar conditions: can we set the condition inside the if?
 
+TODO: check that all tests run in parallel.
+
+TODO: find the talk by Samir and see if we can solve the problem presented there with the
+operators in this package.
+
 TODO: check all outs are closed.
+
+TODO: consistency check on wording for docs.
 
 TODO: document that last values are kept and emitted whenever possible, or change code to not do it.
 
@@ -47,6 +60,8 @@ TODO: check if I forgot some discards
 TODO: check that variables we close over are necessary
 
 TODO: find a way to return contextx when spawning subroutines the caller does not control
+
+TODO: inline composed operators
 
 TODO: chech that types for emit are D instead of other letters
 
@@ -63,6 +78,9 @@ TODO: say that there is no reduce because we have closures
 TODO: check that cancelParent is propagated
 
 TODO: document that reusing a constructor might have unexpected results (e.g. distinct filters also stuff from previous runs).
+
+TODO: figure out a consistent way for parameters passing (e.g. cancelParent, parallelism and stuff should all be in the same order,
+	and cancelParent should probably be last).
 */
 
 ///////////
@@ -101,8 +119,6 @@ type (
 		B B
 		C C
 	}
-
-	Nothing = struct{}
 )
 
 ////////////////////////
@@ -205,6 +221,8 @@ func FromRange(start, end int) SourceOperator[int] {
 //
 // Emissions only start after both inputs have emitted at least once, all emissions
 // before then for the input that emitted first are discarded except for the last value.
+//
+// CombineLatest ends when both inputs end.
 func CombineLatest[A, B any]() ZipOperator[A, B, Pair[A, B]] {
 	return func(a <-chan A, b <-chan B) <-chan Pair[A, B] {
 
@@ -284,7 +302,7 @@ func Concat[T any]() Operator[<-chan T, T] {
 func ForkJoin[A, B any]() ZipOperator[A, B, Pair[A, B]] {
 	return func(a <-chan A, b <-chan B) <-chan Pair[A, B] {
 		o := CombineLatest[A, B]()(a, b)
-		return Last[Pair[A, B]]()(o)
+		return Last[Pair[A, B]](nil)(o)
 	}
 }
 
@@ -1396,6 +1414,8 @@ func At[T any](index int, cancelParent func()) Operator[T, T] {
 	}, cancelParent)
 }
 
+// AtWithDefault is like At but if the input concludes too early a default value
+// is emitted.
 func AtWithDefault[T any](index int, deflt T, cancelParent func()) Operator[T, T] {
 	return Combine(
 		At[T](index, cancelParent),
@@ -1403,6 +1423,7 @@ func AtWithDefault[T any](index int, deflt T, cancelParent func()) Operator[T, T
 	)
 }
 
+// Take forwards the first count items of the input to the output, then it ends.
 func Take[T any](count int, cancelParent func()) Operator[T, T] {
 	cur := 0
 	return FilterCancel(func(in T) (emit, last bool) {
@@ -1414,34 +1435,68 @@ func Take[T any](count int, cancelParent func()) Operator[T, T] {
 	}, cancelParent)
 }
 
-func First[T any](predicate func(T) bool, cancelParent func()) Operator[T, T] {
-	if predicate == nil {
-		predicate = func(T) bool { return true }
-	}
-	return Combine(
-		Filter(predicate),
-		Take[T](1, cancelParent),
-	)
-}
-
-func IgnoreElements[D any]() Operator[D, struct{}] {
-	return Map(func(d D) Nothing {
-		return Nothing{}
-	})
-}
-
-func Last[T any]() Operator[T, T] {
+// TakeUntil forwards the input to the output until the first emission (or closure)
+// of emit, then it ends.
+func TakeUntil[T, D any](emit <-chan D, cancelParent func()) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
 		go func() {
 			defer close(out)
-			var emitted bool
+			for {
+				select {
+				case v, ok := <-in:
+					if !ok {
+						return
+					}
+					out <- v
+				case <-emit:
+					drain(in, cancelParent)
+					return
+				}
+			}
+		}()
+		return out
+	}
+}
+
+// First emits the first item that the predicate returns true for and exits.
+// If predicate is nil, the first element from the input is forwarded to the output.
+func First[T any](predicate func(T) bool, cancelParent func()) Operator[T, T] {
+	if predicate == nil {
+		predicate = func(T) bool { return true }
+	}
+	return FilterCancel(func(in T) (emit, last bool) {
+		ok := predicate(in)
+		return ok, ok
+	}, cancelParent)
+}
+
+// IgnoreElements never emits, and it concludes when the input ends.
+func IgnoreElements[D any]() Operator[D, D] {
+	return Filter(func(D) bool { return false })
+}
+
+// Last only emits the last element from the input that the predicate retuned
+// true for (if any) when the input is closed.
+// If the predicate is nil, the last element is emitted.
+func Last[T any](predicate func(T) bool) Operator[T, T] {
+	if predicate == nil {
+		predicate = func(T) bool { return true }
+	}
+	return func(in <-chan T) <-chan T {
+		out := make(chan T)
+		go func() {
+			defer close(out)
+			var matchedOnce bool
 			var last T
 			for v := range in {
+				if !predicate(v) {
+					continue
+				}
 				last = v
-				emitted = true
+				matchedOnce = true
 			}
-			if emitted {
+			if matchedOnce {
 				out <- last
 			}
 		}()
@@ -1449,6 +1504,11 @@ func Last[T any]() Operator[T, T] {
 	}
 }
 
+// Sample emits the latest value from the input when the provided emitter emits.
+// If no emission from the input has happened between consecutive requests to emit,
+// they are ignored.
+// In other words, no input elements are emitted more than once.
+// If this behavior is not desired, please use Audit instead.
 func Sample[T, D any](emit <-chan D) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
@@ -1470,9 +1530,7 @@ func Sample[T, D any](emit <-chan D) Operator[T, T] {
 					}
 				case v, ok := <-in:
 					if !ok {
-						// Disable this case
-						in = nil
-						continue
+						return
 					}
 					t = v
 					read = true
@@ -1483,6 +1541,8 @@ func Sample[T, D any](emit <-chan D) Operator[T, T] {
 	}
 }
 
+// Skip discards the first count emissions from the input, then it becomes the
+// copy of the input.
 func Skip[T any](count int) Operator[T, T] {
 	cur := 0
 	return Filter(func(in T) bool {
@@ -1494,7 +1554,15 @@ func Skip[T any](count int) Operator[T, T] {
 	})
 }
 
+// SkipLast skips the last count items from the input.
+// Since it needs to keep a buffer, SkipLast will wait until count items are emitted
+// or the input is closed before emitting the first value, and then it becomes
+// a delayed copy of the input that will not emit the last count items.
 func SkipLast[T any](count int) Operator[T, T] {
+	if count == 0 {
+		// Instead of skipping 0 items we ust return the input
+		return func(in <-chan T) <-chan T { return in }
+	}
 	buf := make(chan T, count)
 	return MapFilter(func(in T) (T, bool) {
 		if len(buf) < count {
@@ -1511,6 +1579,7 @@ func SkipLast[T any](count int) Operator[T, T] {
 // Join Operators //
 ////////////////////
 
+// StartWith emits the initial value and then it becomes a copy of the input.
 func StartWith[T any](initial T) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
@@ -1562,6 +1631,8 @@ func WithLatestFrom[I, L any](other <-chan L, cancelOther, cancelParent func()) 
 // Utility Operators //
 ///////////////////////
 
+// Tap calls the observer for every value emitted by the input and forwards that
+// value to the output once observer returns.
 func Tap[T any](observer func(T)) Operator[T, T] {
 	return Map(func(t T) T {
 		observer(t)
@@ -1569,14 +1640,17 @@ func Tap[T any](observer func(T)) Operator[T, T] {
 	})
 }
 
+// TODO
 func Delay[T any](duration time.Duration) Operator[T, T] {
 	return Tap(func(T) { time.Sleep(duration) })
 }
 
+// TODO
 func DelayWhen[T, D any](when <-chan D) Operator[T, T] {
 	return Tap(func(T) { <-when })
 }
 
+// TODO
 func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
@@ -1601,7 +1675,11 @@ func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] 
 	}
 }
 
+// Teardown returns an emitter that is the copy of the input, but it calls
+// deferred at the end of the input with the last emitted value, or with
+// the zero value and emitted set to false.
 func Teardown[T any](deferred func(last T, emitted bool)) Operator[T, T] {
+	// TODO: test
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
 		go func() {
@@ -1732,7 +1810,7 @@ func ReducePreamble[I, O any](preamble func(in I) O, project func(O, I) O) Opera
 func Count[D any]() Operator[D, int] {
 	return Combine(
 		Reduce(func(c int, _ D) int { return c + 1 }, 0),
-		Last[int](),
+		Last[int](nil),
 	)
 }
 
@@ -1746,7 +1824,7 @@ func Max[T constraints.Ordered]() Operator[T, T] {
 				}
 				return max
 			}),
-		Last[T](),
+		Last[T](nil),
 	)
 }
 
@@ -1760,7 +1838,7 @@ func Min[T constraints.Ordered]() Operator[T, T] {
 				}
 				return min
 			}),
-		Last[T](),
+		Last[T](nil),
 	)
 }
 
@@ -1851,10 +1929,30 @@ func Collect[T any](consume func(T) (ok bool), cancelParent func()) SinkOperator
 // Hiher-order Operators //
 ///////////////////////////
 
+// Combine returns an operator that is the combination of the two input ones.
+// When using Combine keep in mind that every operator usually spawns at least one
+// goroutine, so very long combination chains might end up being expensive to run.
+//
+// Also consider that re-using operators might cause unexpected behaviors as some
+// operators preserve state, so for these cases consider CombineFactories or re-calling
+// Combine with freshly built operators every time the combined result is needed.
 func Combine[I, T, O any](a Operator[I, T], b Operator[T, O]) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		t := a(in)
 		return b(t)
+	}
+}
+
+// CombineFactories is like Combine, but it works on operator constructors instead of
+// operators.
+func CombineFactories[I, T, O any](fa func() Operator[I, T], fb func() Operator[T, O]) func() Operator[I, O] {
+	return func() Operator[I, O] {
+		a := fa()
+		b := fb()
+		return func(in <-chan I) <-chan O {
+			t := a(in)
+			return b(t)
+		}
 	}
 }
 

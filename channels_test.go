@@ -287,7 +287,26 @@ func TestFromRange(t *testing.T) {
 	}
 }
 
-// TODO CombineLatest
+func TestCombineLatest(t *testing.T) {
+	parallel(t)
+	a := make(chan int)
+	b := make(chan int)
+	got := ToSliceParallel(CombineLatest[int, int]()(a, b))
+	a <- 1 // Discarded
+	a <- 2 // Buffered
+	b <- 3 // [2,3]
+	a <- 4 // [4, 3]
+	a <- 5 //[5, 3]
+	b <- 6 // [5, 6]
+	close(a)
+	flush()
+	b <- 7 // [5, 7]
+	close(b)
+	want := []Pair[int, int]{{2, 3}, {4, 3}, {5, 3}, {5, 6}, {5, 7}}
+	if diff := cmpDiff(want, <-got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+}
 
 func TestConcat(t *testing.T) {
 	parallel(t)
@@ -1305,6 +1324,7 @@ func TestWindowCount(t *testing.T) {
 }
 
 func TestAudit(t *testing.T) {
+	parallel(t)
 	in := make(chan int)
 	emitCh := make(chan struct{})
 	au := Audit[int](emitCh)(in)
@@ -1387,6 +1407,7 @@ func TestFilterCancel(t *testing.T) {
 		var last bool
 		in := make(chan int)
 		done := make(chan struct{})
+		step := make(chan struct{}, 1)
 		cncl := func() {
 			gotCancel = true
 			close(done)
@@ -1394,12 +1415,16 @@ func TestFilterCancel(t *testing.T) {
 		flt := FilterCancel(func(i int) (e bool, l bool) {
 			mu.Lock()
 			defer mu.Unlock()
+			step <- struct{}{}
 			return i%2 != 0, last
 		}, cncl)(in)
 		got := ToSliceParallel(flt)
 		in <- 0
+		<-step
 		in <- 1
+		<-step
 		in <- 2
+		<-step
 		mu.Lock()
 		last = true
 		mu.Unlock()
@@ -1495,19 +1520,18 @@ func TestAt(t *testing.T) {
 		},
 		{
 			name:  "last",
-			index: 5,
+			index: 4,
 			in:    []int{0, 1, 2, 3, 4},
 			want:  []int{4},
 		},
 		{
 			name:  "too short",
-			index: 5,
+			index: 4,
 			in:    []int{0, 1, 2, 3},
-			want:  []int{},
 		},
 		{
 			name:  "in the middle",
-			index: 5,
+			index: 4,
 			in:    []int{0, 1, 2, 3, 4, 5, 67, 8, 9, 10},
 			want:  []int{4},
 		},
@@ -1524,6 +1548,459 @@ func TestAt(t *testing.T) {
 			}
 			if len(tt.want) != 0 != cancelled {
 				t.Errorf("cancelled: got %v want %v", cancelled, len(tt.want) != 0)
+			}
+		})
+	}
+}
+
+func TestAtWithDefault(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name       string
+		in         []int
+		index, def int
+		wantCancel bool
+		want       []int
+	}{
+		{
+			name: "empty",
+			def:  5,
+			want: []int{5},
+		},
+		{
+			name:  "empty, nonzero index",
+			index: 10,
+			def:   5,
+			want:  []int{5},
+		},
+		{
+			name:       "last",
+			index:      4,
+			def:        42,
+			in:         []int{0, 1, 2, 3, 4},
+			want:       []int{4},
+			wantCancel: true,
+		},
+		{
+			name:  "too short",
+			index: 4,
+			def:   42,
+			in:    []int{0, 1, 2, 3},
+			want:  []int{42},
+		},
+		{
+			name:       "in the middle",
+			index:      4,
+			def:        42,
+			in:         []int{0, 1, 2, 3, 4, 5, 67, 8, 9, 10},
+			want:       []int{4},
+			wantCancel: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cancelled bool
+			cncl := func() { cancelled = true }
+			in := FromSlice(tt.in)()
+			flt := AtWithDefault(tt.index, tt.def, cncl)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if tt.wantCancel != cancelled {
+				t.Errorf("cancelled: got %v want %v", cancelled, tt.wantCancel)
+			}
+		})
+	}
+}
+
+func TestTake(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name       string
+		in         []int
+		count      int
+		want       []int
+		wantCancel bool
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:  "empty, nonzero count",
+			count: 4,
+		},
+		{
+			name:       "part of it",
+			count:      3,
+			in:         []int{0, 1, 2, 3, 4},
+			want:       []int{0, 1, 2},
+			wantCancel: true,
+		},
+		{
+			name:  "input too short",
+			count: 5,
+			in:    []int{0, 1, 2},
+			want:  []int{0, 1, 2},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cancelled bool
+			cncl := func() { cancelled = true }
+			in := FromSlice(tt.in)()
+			flt := Take[int](tt.count, cncl)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if tt.wantCancel != cancelled {
+				t.Errorf("cancelled: got %v want %v", cancelled, tt.wantCancel)
+			}
+		})
+	}
+}
+
+func TestTakeUntil(t *testing.T) {
+	parallel(t)
+	t.Run("with partial emissions", func(t *testing.T) {
+		var cancelled bool
+		cncl := func() { cancelled = true }
+		in := make(chan int)
+		emit := make(chan struct{})
+		tu := TakeUntil[int](emit, cncl)(in)
+		got := ToSliceParallel(tu)
+		in <- 1
+		in <- 2
+		emit <- struct{}{}
+		in <- 3
+		in <- 4
+		close(in)
+		want := []int{1, 2}
+		if diff := cmpDiff(want, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if !cancelled {
+			t.Errorf("cancelled: got false want true")
+		}
+	})
+	t.Run("no emissions", func(t *testing.T) {
+		var cancelled bool
+		cncl := func() { cancelled = true }
+		in := make(chan int)
+		emit := make(chan struct{})
+		tu := TakeUntil[int](emit, cncl)(in)
+		got := ToSliceParallel(tu)
+		emit <- struct{}{}
+		close(in)
+		var want []int
+		if diff := cmpDiff(want, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if !cancelled {
+			t.Errorf("cancelled: got false want true")
+		}
+	})
+	t.Run("no cancel", func(t *testing.T) {
+		var cancelled bool
+		cncl := func() { cancelled = true }
+		in := make(chan int)
+		emit := make(chan struct{})
+		tu := TakeUntil[int](emit, cncl)(in)
+		got := ToSliceParallel(tu)
+		in <- 1
+		in <- 2
+		in <- 3
+		in <- 4
+		close(in)
+		want := []int{1, 2, 3, 4}
+		if diff := cmpDiff(want, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if cancelled {
+			t.Errorf("cancelled: got true want false")
+		}
+	})
+	// TODO no interruption
+}
+
+func TestFirst(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name       string
+		in         []int
+		pred       func(int) bool
+		want       []int
+		wantCancel bool
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "empty, non nil pred",
+			pred: func(int) bool { return false },
+		},
+		{
+			name:       "multiple matches",
+			pred:       func(i int) bool { return i%2 != 0 },
+			in:         []int{0, 1, 2, 3, 4},
+			want:       []int{1},
+			wantCancel: true,
+		},
+		{
+			name:       "no pred",
+			in:         []int{0, 1, 2, 3, 4},
+			want:       []int{0},
+			wantCancel: true,
+		},
+		{
+			name: "no match",
+			pred: func(i int) bool { return false },
+			in:   []int{0, 1, 2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cancelled bool
+			cncl := func() { cancelled = true }
+			in := FromSlice(tt.in)()
+			flt := First(tt.pred, cncl)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if tt.wantCancel != cancelled {
+				t.Errorf("cancelled: got %v want %v", cancelled, tt.wantCancel)
+			}
+		})
+	}
+}
+
+func TestLast(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name string
+		in   []int
+		pred func(int) bool
+		want []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "empty, non nil pred",
+			pred: func(int) bool { return false },
+		},
+		{
+			name: "multiple matches",
+			pred: func(i int) bool { return i%2 != 0 },
+			in:   []int{0, 1, 2, 3, 4},
+			want: []int{3},
+		},
+		{
+			name: "multiple matches, last element",
+			pred: func(i int) bool { return i%2 != 0 },
+			in:   []int{0, 1, 2, 3, 4, 5},
+			want: []int{5},
+		},
+		{
+			name: "no pred",
+			in:   []int{0, 1, 2, 3, 4},
+			want: []int{4},
+		},
+		{
+			name: "no match",
+			pred: func(i int) bool { return false },
+			in:   []int{0, 1, 2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			flt := Last(tt.pred)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSample(t *testing.T) {
+	parallel(t)
+	in := make(chan int)
+	emit := make(chan struct{})
+	e := func() { emit <- struct{}{} }
+	sampled := Sample[int](emit)(in)
+	got := ToSliceParallel(sampled)
+
+	e() // Ignored
+	in <- 1
+	e() // 1
+	in <- 2
+	in <- 3
+	e() // 3
+	e() // Ignored
+	in <- 4
+	close(in)
+	want := []int{1, 3}
+
+	if diff := cmpDiff(want, <-got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+}
+
+func TestSkip(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name  string
+		in    []int
+		count int
+		want  []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:  "empty, nonzero count",
+			count: 4,
+		},
+		{
+			name:  "part of it",
+			count: 3,
+			in:    []int{0, 1, 2, 3, 4},
+			want:  []int{3, 4},
+		},
+		{
+			name:  "input too short",
+			count: 5,
+			in:    []int{0, 1, 2},
+		},
+		{
+			name:  "no skip",
+			count: 0,
+			in:    []int{0, 1, 2, 3, 4},
+			want:  []int{0, 1, 2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			flt := Skip[int](tt.count)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSkipLast(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name  string
+		in    []int
+		count int
+		want  []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:  "empty, nonzero count",
+			count: 4,
+		},
+		{
+			name:  "part of it",
+			count: 3,
+			in:    []int{0, 1, 2, 3, 4},
+			want:  []int{0, 1},
+		},
+		{
+			name:  "input too short",
+			count: 5,
+			in:    []int{0, 1, 2},
+		},
+		{
+			name:  "no skip",
+			count: 0,
+			in:    []int{0, 1, 2, 3, 4},
+			want:  []int{0, 1, 2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			flt := SkipLast[int](tt.count)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestStartWith(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name  string
+		in    []int
+		start int
+		want  []int
+	}{
+		{
+			name:  "empty",
+			start: 1,
+			want:  []int{1},
+		},
+		{
+			name:  "non empty",
+			start: 1,
+			in:    []int{2, 3, 4},
+			want:  []int{1, 2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			flt := StartWith(tt.start)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+// TODO: WithLatestFrom
+
+func TestTap(t *testing.T) {
+	parallel(t)
+
+	var tests = []struct {
+		name string
+		in   []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "non empty",
+			in:   []int{2, 3, 4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			var acc []int
+			accum := func(i int) { acc = append(acc, i) }
+			flt := Tap(accum)(in)
+			got := ToSlice(flt)
+			if diff := cmpDiff(tt.in, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if diff := cmpDiff(tt.in, acc); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
 			}
 		})
 	}
