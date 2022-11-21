@@ -60,21 +60,6 @@ func flush() {
 	time.Sleep(1 * time.Millisecond)
 }
 
-type stubTicker chan time.Time
-
-func newStubTickerFactory(t *testing.T, wantDuration time.Duration, s stubTicker) func(time.Duration) Ticker {
-	return func(d time.Duration) Ticker {
-		t.Helper()
-		if wantDuration != 0 && wantDuration != d {
-			t.Errorf("TickerFactory: got duration %v want %v", d, wantDuration)
-		}
-		return s
-	}
-}
-func newStubTicker() stubTicker             { return make(chan time.Time) }
-func (stubTicker) Stop()                    {}
-func (s stubTicker) Chan() <-chan time.Time { return s }
-
 func TestFromFunc(t *testing.T) {
 	parallel(t)
 	var tests = []struct {
@@ -1974,6 +1959,30 @@ func TestStartWith(t *testing.T) {
 
 // TODO: WithLatestFrom
 
+func TestWithLatestFrom(t *testing.T) {
+	in := make(chan int)
+	other := make(chan string)
+	cancelled := false
+	cncl := func() { cancelled = true }
+	wlf := WithLatestFrom[int](other, cncl)(in)
+	got := ToSliceParallel(wlf)
+	in <- 0      // Discarded
+	in <- 1      // Discarded
+	other <- "2" // Discarded
+	in <- 3      // [3, "2"]
+	in <- 4      // [4, "2"]
+	other <- "5" // Buffered
+	in <- 6      // [6, "5"]
+	close(in)
+	want := []Pair[int, string]{{3, "2"}, {4, "2"}, {6, "5"}}
+	if diff := cmpDiff(want, <-got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+	if !cancelled {
+		t.Error("other didn't get cancelled")
+	}
+}
+
 func TestTap(t *testing.T) {
 	parallel(t)
 
@@ -2004,4 +2013,128 @@ func TestTap(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTimeout(t *testing.T) {
+	t.Run("expired", func(t *testing.T) {
+		c := newStubClock()
+		cancelled := false
+		cncl := func() { cancelled = true }
+		in := make(chan int)
+		to := Timeout[int](c, 1*time.Minute, cncl)(in)
+		got := ToSliceParallel[int](to)
+		c.Emit() // Timed out
+		var want []int
+		if diff := cmpDiff(want, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if !cancelled {
+			t.Error("didn't cancel expired emitter")
+		}
+	})
+	t.Run("not expired", func(t *testing.T) {
+		c := newStubClock()
+		cancelled := false
+		cncl := func() { cancelled = true }
+		in := make(chan int)
+		to := Timeout[int](c, 1*time.Minute, cncl)(in)
+		got := ToSliceParallel[int](to)
+		in <- 1
+		select {
+		case c <- time.Time{}:
+			// Ignored
+		default:
+		}
+		in <- 2
+		in <- 3
+		close(in)
+		want := []int{1, 2, 3}
+		if diff := cmpDiff(want, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if cancelled {
+			t.Error("got unwanted cancel")
+		}
+	})
+}
+
+func TestTeardown(t *testing.T) {
+	t.Run("no emission", func(t *testing.T) {
+		in := make(chan int)
+		close(in)
+		var last int
+		var emitted bool
+		out := Teardown(func(l int, e bool) {
+			last = l
+			emitted = e
+		})(in)
+
+		got := ToSliceParallel(out)
+		var want []int
+		if diff := cmpDiff(want, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if emitted {
+			t.Error("emitted: got true want false")
+		}
+		if last != 0 {
+			t.Errorf("last: got %v want 0", last)
+		}
+	})
+
+	t.Run("emissions", func(t *testing.T) {
+		in := make(chan int)
+		var last int
+		var emitted bool
+		out := Teardown(func(l int, e bool) {
+			last = l
+			emitted = e
+		})(in)
+		got := ToSliceParallel(out)
+		in <- 1
+		in <- 2
+		in <- 3
+		close(in)
+		want := []int{1, 2, 3}
+		if diff := cmpDiff(want, <-got); diff != "" {
+			t.Errorf("-want +got:\n%s", diff)
+		}
+		if !emitted {
+			t.Error("emitted: got false want true")
+		}
+		if last != 3 {
+			t.Errorf("last: got %v want 0", last)
+		}
+	})
+}
+
+////////////////
+// Test Utils //
+////////////////
+
+type stubTicker chan time.Time
+
+func newStubTickerFactory(t *testing.T, wantDuration time.Duration, s stubTicker) func(time.Duration) Ticker {
+	return func(d time.Duration) Ticker {
+		t.Helper()
+		if wantDuration != 0 && wantDuration != d {
+			t.Errorf("TickerFactory: got duration %v want %v", d, wantDuration)
+		}
+		return s
+	}
+}
+func newStubTicker() stubTicker             { return make(chan time.Time) }
+func (stubTicker) Stop()                    {}
+func (s stubTicker) Chan() <-chan time.Time { return s }
+
+type stubClock chan time.Time
+
+func newStubClock() stubClock {
+	return make(chan time.Time)
+}
+func (s stubClock) After(time.Duration) <-chan time.Time {
+	return s
+}
+func (s stubClock) Emit() {
+	s <- time.Time{}
 }

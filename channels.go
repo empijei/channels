@@ -1594,7 +1594,15 @@ func StartWith[T any](initial T) Operator[T, T] {
 	}
 }
 
-func WithLatestFrom[I, L any](other <-chan L, cancelOther, cancelParent func()) Operator[I, Pair[I, L]] {
+// WithLatestFrom starts emitting when both the input and the other emitter have
+// emitted at least once.
+// It then emits every time the input emits, pairing that value with the latest
+// coming from the other one.
+// If the other emitter is closed, its last emitted value will still be used until
+// the input is closed.
+// If the other emitter never emits, the returned emitter will also never emit and
+// end when the input ends.
+func WithLatestFrom[I, L any](other <-chan L, cancelOther func()) Operator[I, Pair[I, L]] {
 	return func(in <-chan I) <-chan Pair[I, L] {
 		out := make(chan Pair[I, L])
 		go func() {
@@ -1615,8 +1623,9 @@ func WithLatestFrom[I, L any](other <-chan L, cancelOther, cancelParent func()) 
 					out <- cur
 				case v, ok := <-other:
 					if !ok {
-						drain(in, cancelParent)
-						return
+						// Disable this case.
+						other = nil
+						continue
 					}
 					otherEmitted = true
 					cur.B = v
@@ -1640,23 +1649,19 @@ func Tap[T any](observer func(T)) Operator[T, T] {
 	})
 }
 
-// TODO
-func Delay[T any](duration time.Duration) Operator[T, T] {
-	return Tap(func(T) { time.Sleep(duration) })
-}
-
-// TODO
-func DelayWhen[T, D any](when <-chan D) Operator[T, T] {
-	return Tap(func(T) { <-when })
-}
-
-// TODO
-func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] {
+// Timeout creates a copy of the input unless the input takes more than maxDuration
+// to emit the first value, in which case the output is closed.
+func Timeout[T any](c Clock, maxDuration time.Duration, cancelParent func()) Operator[T, T] {
+	if c == nil {
+		c = NewRealClock()
+	}
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
 		go func() {
 			defer close(out)
-			expire := time.After(duration)
+			// TODO: use a timer factory, so that
+			// we can stop the timer when the input emits
+			expire := c.After(maxDuration)
 			select {
 			case v, ok := <-in:
 				if !ok {
@@ -1679,7 +1684,6 @@ func Timeout[T any](duration time.Duration, cancelParent func()) Operator[T, T] 
 // deferred at the end of the input with the last emitted value, or with
 // the zero value and emitted set to false.
 func Teardown[T any](deferred func(last T, emitted bool)) Operator[T, T] {
-	// TODO: test
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
 		go func() {
