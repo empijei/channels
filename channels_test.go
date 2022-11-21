@@ -28,6 +28,37 @@ import (
 	. "github.com/empijei/channels"
 )
 
+////////////////
+// Test Utils //
+////////////////
+
+type stubTicker chan time.Time
+
+func newStubTickerFactory(t *testing.T, wantDuration time.Duration, s stubTicker) func(time.Duration) Ticker {
+	return func(d time.Duration) Ticker {
+		t.Helper()
+		if wantDuration != 0 && wantDuration != d {
+			t.Errorf("TickerFactory: got duration %v want %v", d, wantDuration)
+		}
+		return s
+	}
+}
+func newStubTicker() stubTicker             { return make(chan time.Time) }
+func (stubTicker) Stop()                    {}
+func (s stubTicker) Chan() <-chan time.Time { return s }
+
+type stubClock chan time.Time
+
+func newStubClock() stubClock {
+	return make(chan time.Time)
+}
+func (s stubClock) After(time.Duration) <-chan time.Time {
+	return s
+}
+func (s stubClock) Emit() {
+	s <- time.Time{}
+}
+
 // TODO: find a way to check for goroutine leaks.
 
 const parall = true
@@ -59,6 +90,10 @@ func flush() {
 	}
 	time.Sleep(1 * time.Millisecond)
 }
+
+///////////
+// Tests //
+///////////
 
 func TestFromFunc(t *testing.T) {
 	parallel(t)
@@ -2064,13 +2099,14 @@ func TestTeardown(t *testing.T) {
 		close(in)
 		var last int
 		var emitted bool
-		out := Teardown(func(l int, e bool) {
+		out := Teardown(func(l int, e bool) (int, bool) {
 			last = l
 			emitted = e
+			return 2, true
 		})(in)
 
 		got := ToSliceParallel(out)
-		var want []int
+		want := []int{2}
 		if diff := cmpDiff(want, <-got); diff != "" {
 			t.Errorf("-want +got:\n%s", diff)
 		}
@@ -2086,9 +2122,10 @@ func TestTeardown(t *testing.T) {
 		in := make(chan int)
 		var last int
 		var emitted bool
-		out := Teardown(func(l int, e bool) {
+		out := Teardown(func(l int, e bool) (int, bool) {
 			last = l
 			emitted = e
+			return 4, false
 		})(in)
 		got := ToSliceParallel(out)
 		in <- 1
@@ -2108,33 +2145,116 @@ func TestTeardown(t *testing.T) {
 	})
 }
 
-////////////////
-// Test Utils //
-////////////////
-
-type stubTicker chan time.Time
-
-func newStubTickerFactory(t *testing.T, wantDuration time.Duration, s stubTicker) func(time.Duration) Ticker {
-	return func(d time.Duration) Ticker {
-		t.Helper()
-		if wantDuration != 0 && wantDuration != d {
-			t.Errorf("TickerFactory: got duration %v want %v", d, wantDuration)
-		}
-		return s
+func TestEvery(t *testing.T) {
+	var tests = []struct {
+		name             string
+		in               []int
+		want, wantCancel bool
+	}{
+		{
+			name: "empty",
+			want: true,
+		},
+		{
+			name:       "non empty, not match",
+			in:         []int{2, 3, 4},
+			wantCancel: true,
+		},
+		{
+			name: "non empty, match",
+			in:   []int{2, 4, 6},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			cancelled := false
+			res := Every(
+				func(i int) bool { return i%2 == 0 },
+				func() { cancelled = true },
+			)(in)
+			got := ToSlice(res)[0]
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if cancelled != tt.wantCancel {
+				t.Errorf("cancelled: got %v want %v", cancelled, tt.wantCancel)
+			}
+		})
 	}
 }
-func newStubTicker() stubTicker             { return make(chan time.Time) }
-func (stubTicker) Stop()                    {}
-func (s stubTicker) Chan() <-chan time.Time { return s }
 
-type stubClock chan time.Time
+func TestFindIndex(t *testing.T) {
+	var tests = []struct {
+		name       string
+		in         []int
+		want       []int
+		wantCancel bool
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "non empty, not match",
+			in:   []int{1, 3, 5},
+		},
+		{
+			name:       "non empty, match",
+			in:         []int{11, 12, 13},
+			want:       []int{1},
+			wantCancel: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			cancelled := false
+			res := FindIndex(
+				func(i int) bool { return i%2 == 0 },
+				func() { cancelled = true },
+			)(in)
+			got := ToSlice(res)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if cancelled != tt.wantCancel {
+				t.Errorf("cancelled: got %v want %v", cancelled, tt.wantCancel)
+			}
+		})
+	}
+}
 
-func newStubClock() stubClock {
-	return make(chan time.Time)
-}
-func (s stubClock) After(time.Duration) <-chan time.Time {
-	return s
-}
-func (s stubClock) Emit() {
-	s <- time.Time{}
+func TestIsEmpty(t *testing.T) {
+	var tests = []struct {
+		name       string
+		in         []int
+		want       bool
+		wantCancel bool
+	}{
+		{
+			name: "empty",
+			want: true,
+		},
+		{
+			name:       "non empty, not match",
+			in:         []int{1, 3, 5},
+			want:       false,
+			wantCancel: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			cancelled := false
+			res := IsEmpty[int](func() { cancelled = true })(in)
+			got := ToSlice(res)[0]
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if cancelled != tt.wantCancel {
+				t.Errorf("cancelled: got %v want %v", cancelled, tt.wantCancel)
+			}
+		})
+	}
 }

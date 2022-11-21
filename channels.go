@@ -34,6 +34,8 @@ emit is closed, and drain input.
 TODO: make sure that wording like "forwards", "becomes a copy" etc. are consistently
 used and well defined in the doc.
 
+TODO: create a styleguide on when and where operators should be invoked.
+
 type outT = struct {
 a A
 b B
@@ -1683,14 +1685,21 @@ func Timeout[T any](c Clock, maxDuration time.Duration, cancelParent func()) Ope
 // Teardown returns an emitter that is the copy of the input, but it calls
 // deferred at the end of the input with the last emitted value, or with
 // the zero value and emitted set to false.
-func Teardown[T any](deferred func(last T, emitted bool)) Operator[T, T] {
+// The deferred func can optionally return a value to emit as a last value.
+func Teardown[T any](deferred func(last T, emitted bool) (additional T, emitAdditional bool)) Operator[T, T] {
 	return func(in <-chan T) <-chan T {
 		out := make(chan T)
 		go func() {
 			defer close(out)
 			var emitted bool
 			var last T
-			defer func() { deferred(last, emitted) }()
+			defer func() {
+				a, e := deferred(last, emitted)
+				if !e {
+					return
+				}
+				out <- a
+			}()
 			for v := range in {
 				last = v
 				emitted = true
@@ -1705,62 +1714,67 @@ func Teardown[T any](deferred func(last T, emitted bool)) Operator[T, T] {
 // Conditional and Boolean Operators //
 ///////////////////////////////////////
 
+// DefaultIfEmpty emits the default value if and only if the input emitter did not
+// emit before being closed.
 func DefaultIfEmpty[T any](deflt T) Operator[T, T] {
-	return func(in <-chan T) <-chan T {
-		out := make(chan T)
+	return Teardown(func(_ T, emitted bool) (T, bool) {
+		return deflt, !emitted
+	})
+}
+
+// Every returns whether all values emitted by the input match the predicate.
+// If no value is emitted, it returns true.
+// Every cancels and discard the parent as soon as the first non-matching value is encountered.
+func Every[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
+	return func(in <-chan T) <-chan bool {
+		out := make(chan bool)
 		go func() {
 			defer close(out)
-			var emitted bool
 			for v := range in {
-				emitted = true
-				out <- v
+				if !predicate(v) {
+					drain(in, cancelParent)
+					out <- false
+					return
+				}
 			}
-			if emitted {
-				return
-			}
-			out <- deflt
+			out <- true
 		}()
 		return out
 	}
 }
 
-func Every[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
-	ok := true
-	return MapFilterCancelTeardown(
-		func(in T) (o bool, emit, ok bool) {
-			if ok := predicate(in); ok {
-				return true, false, true
-			}
-			ok = false
-			return false, true, false
-		},
-		cancelParent,
-		func(T, bool) (bool, bool) {
-			return ok, ok
-		})
-}
-
+// FindIndex emits the index for the first input that matches the predicate and it ends.
 func FindIndex[T any](predicate func(T) bool, cancelParent func()) Operator[T, int] {
-	count := 0
-	return MapFilterCancel(func(in T) (out int, e, ok bool) {
-		if ok := predicate(in); ok {
-			return count, true, false
-		}
-		count++
-		return 0, false, true
-	}, cancelParent)
+	return func(in <-chan T) <-chan int {
+		out := make(chan int)
+		go func() {
+			defer close(out)
+			count := 0
+			for v := range in {
+				if !predicate(v) {
+					count++
+					continue
+				}
+				drain(in, cancelParent)
+				out <- count
+				return
+			}
+		}()
+		return out
+	}
 }
 
-func IsEmpty[T any](predicate func(T) bool, cancelParent func()) Operator[T, bool] {
-	return func(in <-chan T) <-chan bool {
+// IsEmpty emits exactly once to report whether the input is empty or not.
+func IsEmpty[D any](cancelParent func()) Operator[D, bool] {
+	return func(in <-chan D) <-chan bool {
 		out := make(chan bool)
 		go func() {
 			defer close(out)
-			var emitted bool
-			for range in {
-				emitted = true
+			_, ok := <-in
+			if ok {
+				drain(in, cancelParent)
 			}
-			out <- !emitted
+			out <- !ok
 		}()
 		return out
 	}
@@ -1771,12 +1785,18 @@ func IsEmpty[T any](predicate func(T) bool, cancelParent func()) Operator[T, boo
 //////////////////////////////////////////
 
 func Reduce[I, O any](project func(accum O, in I) O, seed O) Operator[I, O] {
-	// TODO: this is wrong, this is not Reduce, this is Scan.
-	// Reduce should only emit once at the end.
-	return ReduceAcc(func(accum O, in I) (newAccum O, out O) {
-		got := project(accum, in)
-		return got, got
-	}, seed)
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			acc := seed
+			for v := range in {
+				acc = project(acc, v)
+			}
+			out <- acc
+		}()
+		return out
+	}
 }
 
 func ReduceAcc[I, O, A any](project func(accum A, in I) (newAccum A, out O), seed A) Operator[I, O] {
