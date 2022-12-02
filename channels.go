@@ -1341,14 +1341,16 @@ func FilterCancel[T any](predicate func(T) (emit, last bool), cancelParent func(
 // Note: this needs to keep a set of all seen values in memory, so it might use
 // a lot of memory.
 func Distinct[T comparable]() Operator[T, T] {
-	seen := map[T]bool{}
-	return Filter(func(in T) bool {
-		if seen[in] {
-			return false
-		}
-		seen[in] = true
-		return true
-	})
+	return func(in <-chan T) <-chan T {
+		seen := map[T]bool{}
+		return Filter(func(in T) bool {
+			if seen[in] {
+				return false
+			}
+			seen[in] = true
+			return true
+		})(in)
+	}
 }
 
 // DistinctKey is like Distinct but it accepts a keyer function to compare elements.
@@ -1785,6 +1787,7 @@ func IsEmpty[D any](cancelParent func()) Operator[D, bool] {
 //////////////////////////////////////////
 
 func Reduce[I, O any](project func(accum O, in I) O, seed O) Operator[I, O] {
+
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 		go func() {
