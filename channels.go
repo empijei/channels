@@ -83,6 +83,8 @@ TODO: document that reusing a constructor might have unexpected results (e.g. di
 
 TODO: figure out a consistent way for parameters passing (e.g. cancelParent, parallelism and stuff should all be in the same order,
 	and cancelParent should probably be last).
+
+	TODO: check that state variable are not preserved across calls.
 */
 
 ///////////
@@ -103,9 +105,9 @@ type (
 
 	Operator[I, O any] func(<-chan I) <-chan O
 
-	FanOutOperator[I, O any]       func(<-chan I) []<-chan O
-	ZipOperator[A, B, O any]       func(<-chan A, <-chan B) <-chan O
-	PartitionOperator[I, O, P any] func(<-chan I) (<-chan O, <-chan P)
+	FanOutOperator[I, O any]   func(<-chan I) []<-chan O
+	ZipOperator[A, B, O any]   func(<-chan A, <-chan B) <-chan O
+	SplitOperator[I, O, P any] func(<-chan I) (<-chan O, <-chan P)
 
 	FanInOperator[I, O any] func(...<-chan I) <-chan O
 
@@ -341,7 +343,7 @@ func Merge[T any]() Operator[<-chan T, T] {
 
 // Partition emits values that match the condition on the first output (then)
 // and the values that don't on the second output (elze).
-func Partition[T any](condition func(t T) bool) PartitionOperator[T, T, T] {
+func Partition[T any](condition func(t T) bool) SplitOperator[T, T, T] {
 	if condition == nil {
 		panic("Partition: condition cannot be nil.")
 	}
@@ -361,6 +363,37 @@ func Partition[T any](condition func(t T) bool) PartitionOperator[T, T, T] {
 			}
 		}()
 		return th, el
+	}
+}
+
+// Tee duplicates the input to the two outputs.
+// Tee guarantees that input scanning only proceeds if both copies of the previous
+// input have been received.
+func Tee[T any]() SplitOperator[T, T, T] {
+	return func(in <-chan T) (<-chan T, <-chan T) {
+		a := make(chan T)
+		b := make(chan T)
+
+		go func() {
+			defer close(a)
+			defer close(b)
+			for v := range in {
+				cura := a
+				curb := b
+				for {
+					select {
+					case cura <- v:
+						cura = nil
+					case curb <- v:
+						curb = nil
+					}
+					if cura == nil && curb == nil {
+						break
+					}
+				}
+			}
+		}()
+		return a, b
 	}
 }
 
@@ -1786,87 +1819,106 @@ func IsEmpty[D any](cancelParent func()) Operator[D, bool] {
 // Mathematical and Aggregate Operators //
 //////////////////////////////////////////
 
-func Reduce[I, O any](project func(accum O, in I) O, seed O) Operator[I, O] {
-
+// ReduceFuncAcc calls the seed func to compute the first accumulator value, then
+// scans the input subcessively calling project.
+// Once the input is closed, it emits the last output value, or nothing if the input never emitted.
+func ReduceFuncAcc[I, O, A any](project func(accum A, in I) (A, O), seed func(in I) (A, O)) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
 		go func() {
 			defer close(out)
-			acc := seed
-			for v := range in {
-				acc = project(acc, v)
+			var (
+				accum   A
+				last    O
+				emitted bool
+			)
+			for i := range in {
+				if !emitted {
+					accum, last = seed(i)
+					emitted = true
+					continue
+				}
+				accum, last = project(accum, i)
 			}
-			out <- acc
+			if emitted {
+				out <- last
+			}
 		}()
 		return out
 	}
 }
 
+// ReduceFunc calls the seed func to compute the first accumulator value, then
+// scans the input subcessively calling project.
+// Once the input is closed, it emits the last output value, or nothing if the input never emitted.
+func ReduceFunc[I, O any](project func(accum O, in I) O, seed func(in I) O) Operator[I, O] {
+	return func(in <-chan I) <-chan O {
+		out := make(chan O)
+		go func() {
+			defer close(out)
+			var (
+				accum   O
+				emitted bool
+			)
+			for i := range in {
+				if !emitted {
+					accum = seed(i)
+					emitted = true
+					continue
+				}
+				accum = project(accum, i)
+			}
+			if emitted {
+				out <- accum
+			}
+		}()
+		return out
+	}
+}
+
+// ReduceAcc scans the input calling the project function with the previous value for
+// the accumulator and the current value for the input.
+// Once the input is closed, it emits the last output value, or nothing if the input never emitted.
 func ReduceAcc[I, O, A any](project func(accum A, in I) (newAccum A, out O), seed A) Operator[I, O] {
-	acc := seed
-	return Map(func(in I) (o O) {
-		acc, o = project(acc, in)
-		return o
+	return ReduceFuncAcc(project, func(in I) (A, O) {
+		return project(seed, in)
 	})
 }
 
-func ReducePreambleAcc[I, O, A any](preamble func(in I) (A, O), project func(accum A, in I) (A, O)) Operator[I, O] {
-	var accum A
-	emitted := false
-	return ReduceAcc(func(accum A, in I) (A, O) {
-		if !emitted {
-			emitted = true
-			return preamble(in)
-		}
-		return project(accum, in)
-	}, accum)
-}
-func ReducePreamble[I, O any](preamble func(in I) O, project func(O, I) O) Operator[I, O] {
-	return ReducePreambleAcc(
-		func(in I) (O, O) {
-			v := preamble(in)
-			return v, v
-		},
-		func(acc O, in I) (O, O) {
-			o := project(acc, in)
-			return o, o
-		},
-	)
+// Reduce is like ReduceAcc, but the accumulator is used as the output value.
+func Reduce[I, O any](project func(accum O, in I) O, seed O) Operator[I, O] {
+	return ReduceAcc(func(accum O, in I) (O, O) {
+		o := project(accum, in)
+		return o, o
+	}, seed)
 }
 
+// Count emits the item count of the input.
 func Count[D any]() Operator[D, int] {
 	return Combine(
-		Reduce(func(c int, _ D) int { return c + 1 }, 0),
-		Last[int](nil),
+		Reduce(func(sum int, in D) int { return sum + 1 }, 0),
+		DefaultIfEmpty(0),
 	)
 }
 
+// Max emits the max element of the input.
 func Max[T constraints.Ordered]() Operator[T, T] {
-	return Combine(
-		ReducePreamble(
-			func(i T) T { return i },
-			func(max, i T) T {
-				if max < i {
-					return i
-				}
-				return max
-			}),
-		Last[T](nil),
-	)
+	return ReduceFunc(func(max, cur T) T {
+		if cur > max {
+			return cur
+		}
+		return max
+	}, func(first T) T { return first })
 }
 
+// Min emits the min element of the input.
 func Min[T constraints.Ordered]() Operator[T, T] {
-	return Combine(
-		ReducePreamble(
-			func(i T) T { return i },
-			func(min, i T) T {
-				if min > i {
-					return i
-				}
-				return min
-			}),
-		Last[T](nil),
-	)
+	return ReduceFunc(func(min, cur T) T {
+		if cur < min {
+			return cur
+		}
+		return min
+	}, func(first T) T { return first })
 }
 
 /*
@@ -1884,8 +1936,10 @@ func Min[T constraints.Ordered]() Operator[T, T] {
 // Consuming Operators //
 /////////////////////////
 
-func Discard[T any]() SinkOperator[T] {
-	return func(in <-chan T) {
+// Discard spawns a goroutine that consumes the input and returns immediately.
+// If a nil input is passed, it's ignored.
+func Discard[D any]() SinkOperator[D] {
+	return func(in <-chan D) {
 		if in == nil {
 			return
 		}
@@ -1896,6 +1950,18 @@ func Discard[T any]() SinkOperator[T] {
 	}
 }
 
+// Wait blocks until the input is closed.
+func Wait[D any]() SinkOperator[D] {
+	return func(in <-chan D) {
+		if in == nil {
+			return
+		}
+		for range in {
+		}
+	}
+}
+
+// ToSlice collects all inputs in a slice.
 func ToSlice[T any](in <-chan T) []T {
 	var res []T
 	for v := range in {
@@ -1904,6 +1970,7 @@ func ToSlice[T any](in <-chan T) []T {
 	return res
 }
 
+// ToSliceParallel is like ToSlice, but emits the collected slice when the input is closed.
 func ToSliceParallel[T any](in <-chan T) <-chan []T {
 	out := make(chan []T)
 	go func() {
@@ -1917,6 +1984,7 @@ func ToSliceParallel[T any](in <-chan T) <-chan []T {
 	return out
 }
 
+// ToSlices collects two channels into two slices, in parallel.
 func ToSlices[I, L any](i <-chan I, l <-chan L) ([]I, []L) {
 	var ri []I
 	var rl []L
@@ -1938,18 +2006,24 @@ func ToSlices[I, L any](i <-chan I, l <-chan L) ([]I, []L) {
 	return ri, rl
 }
 
+// Collect calls the consume func once per every input item.
+// If the consume function returns false, it cancels the parent, discards the input
+// and exits.
 func Collect[T any](consume func(T) (ok bool), cancelParent func()) SinkOperator[T] {
 	return func(in <-chan T) {
 		for v := range in {
 			if ok := consume(v); !ok {
-				if cancelParent != nil {
-					cancelParent()
-				}
-				// TODO: point out why [T] is needed
-				Discard[T]()(in)
+				drain(in, cancelParent)
 			}
 		}
 	}
+}
+
+// AbortOnErr returns the first non-nil error encountered (cancelling the parent)
+// and discards the others.
+// If no error is encountered, it returns nil.
+func AbortOnErr(in <-chan error, cancelParent func()) error {
+	return <-First(func(err error) bool { return err != nil }, cancelParent)(in)
 }
 
 ///////////////////////////
@@ -1991,5 +2065,6 @@ func drain[T any](in <-chan T, cancel func()) {
 	if cancel != nil {
 		cancel()
 	}
+	// TODO: point out why this T is needed here.
 	Discard[T]()(in)
 }

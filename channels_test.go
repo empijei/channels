@@ -70,7 +70,7 @@ func parallel(t *testing.T) {
 }
 
 // TODO(clap): use this instead of cmp.Diff
-
+// TODO(clap): talk about this
 func cmpDiff[T any](a, b T, opts ...cmp.Option) string {
 	return cmp.Diff(a, b, opts...)
 }
@@ -2057,7 +2057,7 @@ func TestTimeout(t *testing.T) {
 		cncl := func() { cancelled = true }
 		in := make(chan int)
 		to := Timeout[int](c, 1*time.Minute, cncl)(in)
-		got := ToSliceParallel[int](to)
+		got := ToSliceParallel(to)
 		c.Emit() // Timed out
 		var want []int
 		if diff := cmpDiff(want, <-got); diff != "" {
@@ -2073,7 +2073,7 @@ func TestTimeout(t *testing.T) {
 		cncl := func() { cancelled = true }
 		in := make(chan int)
 		to := Timeout[int](c, 1*time.Minute, cncl)(in)
-		got := ToSliceParallel[int](to)
+		got := ToSliceParallel(to)
 		in <- 1
 		select {
 		case c <- time.Time{}:
@@ -2254,6 +2254,113 @@ func TestIsEmpty(t *testing.T) {
 			}
 			if cancelled != tt.wantCancel {
 				t.Errorf("cancelled: got %v want %v", cancelled, tt.wantCancel)
+			}
+		})
+	}
+}
+
+func TestReduce(t *testing.T) {
+	var tests = []struct {
+		name string
+		in   []int
+		want []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "one",
+			in:   []int{1},
+			want: []int{1},
+		},
+		{
+			name: "non empty",
+			in:   []int{1, 2, 3},
+			want: []int{6},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			res := Reduce(func(sum, cur int) int {
+				return sum + cur
+			}, 0)(in)
+			got := ToSlice(res)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestCount(t *testing.T) {
+	var tests = []struct {
+		name string
+		in   []int
+		want []int
+	}{
+		{
+			name: "empty",
+			want: []int{0},
+		},
+		{
+			name: "one",
+			in:   []int{1},
+			want: []int{1},
+		},
+		{
+			name: "non empty",
+			in:   []int{1, 2, 3},
+			want: []int{3},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			res := Count[int]()(in)
+			got := ToSlice(res)
+			if diff := cmpDiff(tt.want, got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestTeeMinMax(t *testing.T) {
+	var tests = []struct {
+		name             string
+		in               []int
+		wantMin, wantMax []int
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name:    "one",
+			in:      []int{1},
+			wantMin: []int{1},
+			wantMax: []int{1},
+		},
+		{
+			name:    "non empty",
+			in:      []int{2, 1, 4, 3},
+			wantMin: []int{1},
+			wantMax: []int{4},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			in := FromSlice(tt.in)()
+			a, b := Tee[int]()(in)
+			min := Min[int]()(a)
+			max := Max[int]()(b)
+			gotMin := ToSliceParallel(min)
+			gotMax := ToSliceParallel(max)
+			if diff := cmpDiff(tt.wantMin, <-gotMin); diff != "" {
+				t.Errorf("Min(%v): -want +got:\n%s", tt.in, diff)
+			}
+			if diff := cmpDiff(tt.wantMax, <-gotMax); diff != "" {
+				t.Errorf("Max(%v): -want +got:\n%s", tt.in, diff)
 			}
 		})
 	}
