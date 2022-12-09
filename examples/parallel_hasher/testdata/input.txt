@@ -1,0 +1,3 @@
+this is the first line to hash
+this is the second line
+let's do a last one

@@ -20,12 +20,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/exp/constraints"
+	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -104,6 +106,11 @@ type (
 		B B
 		C C
 	}
+
+	Error       = <-chan error
+	ErrorSink   = chan<- Error
+	ErrorSource = <-chan Error
+	ErrorPipe   = chan Error
 )
 
 ////////////////////////
@@ -214,14 +221,17 @@ func FromReaderLines(r io.Reader, errs chan<- error) SourceOperator[string] {
 }
 
 // FromFileLines is like FromReaderLines but for files.
-func FromFileLines(fsys fs.FS, path string, errs chan<- error) SourceOperator[string] {
+func FromFileLines(path string, errs ErrorSink) SourceOperator[string] {
 	return func() <-chan string {
 		out := make(chan string)
+		errOut := make(chan error, 1)
+		errs <- errOut
 		go func() {
 			defer close(out)
-			f, err := fsys.Open(path)
+			defer close(errOut)
+			f, err := os.Open(path)
 			if err != nil {
-				errs <- err
+				errOut <- err
 				return
 			}
 			defer f.Close()
@@ -229,7 +239,7 @@ func FromFileLines(fsys fs.FS, path string, errs chan<- error) SourceOperator[st
 			for s.Scan() {
 				out <- s.Text()
 			}
-			errs <- s.Err()
+			errOut <- s.Err()
 		}()
 		return out
 	}
@@ -904,9 +914,10 @@ func MapFilterCancelTeardown[I, O any](
 
 // ParallelMap is like Map but runs the project function in parallel.
 // Output order is not guaranteed to be related to input order.
+// If maxParallelism is 0 or negative, the number of CPU is used.
 func ParallelMap[I, O any](maxParallelism int, project func(in I) O) Operator[I, O] {
-	if maxParallelism == 0 {
-		panic("ParallelMap: maxParallelism must be positive")
+	if maxParallelism <= 0 {
+		maxParallelism = runtime.NumCPU()
 	}
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -932,8 +943,8 @@ func ParallelMap[I, O any](maxParallelism int, project func(in I) O) Operator[I,
 
 // ParallelMapCancel is like ParallelMap, but allows the project function to abort operations.
 func ParallelMapCancel[I, O any](maxParallelism int, project func(context.Context, I) (o O, ok bool), cancelParent func()) Operator[I, O] {
-	if maxParallelism == 0 {
-		panic("ParallelMapCancel: maxParallelism must be positive")
+	if maxParallelism <= 0 {
+		maxParallelism = runtime.NumCPU()
 	}
 	return func(in <-chan I) <-chan O {
 		wg, ctx := errgroup.WithContext(context.Background())
@@ -976,12 +987,14 @@ func ParallelMapCancel[I, O any](maxParallelism int, project func(context.Contex
 // N+maxWindow is read, ParallelMapStable will wait for item N to be done processing.
 // Using a maxWindow smaller than maxParallelism is not useful as the maxParallelism will
 // never be achieved.
+// If maxParallelism is 0 or negative the number of CPUs is used instead.
+// If maxWindow is 0 or negative a default is used.
 func ParallelMapStable[I, O any](maxParallelism, maxWindow int, project func(in I) O) Operator[I, O] {
 	if maxParallelism <= 0 {
-		panic("ParallelMapStable: maxParallelism must be positive")
+		maxParallelism = runtime.NumCPU()
 	}
 	if maxWindow <= 0 {
-		panic("ParallelMapStable: maxWindow must be positive")
+		maxWindow = maxParallelism * runtime.NumCPU()
 	}
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -1091,7 +1104,7 @@ func ParallelMapStable[I, O any](maxParallelism, maxWindow int, project func(in 
 // Order of the output is not guaranteed to be related to the order of the input.
 func MergeMap[I, O any](maxParallelism int, project func(in I) <-chan O) Operator[I, O] {
 	if maxParallelism <= 0 {
-		panic("MergeMap: maxParallelism must be positive")
+		maxParallelism = runtime.NumCPU()
 	}
 	semaphore := make(chan struct{}, maxParallelism)
 	return func(in <-chan I) <-chan O {
@@ -1984,27 +1997,33 @@ func Wait[D any]() SinkOperator[D] {
 
 // ToFileLines truncates or creates the file at the specified path and writes to it
 // all inputs as lines (using fmt.Fprintln).
-func ToFileLines(path string, in <-chan any, errs chan<- error, cancelParent func()) {
-	out, err := os.Create(path)
-	if err != nil {
-		drain(in, cancelParent)
-		errs <- err
-		return
-	}
-	buf := bufio.NewWriter(out)
-	defer func() {
-		if err := buf.Flush(); err != nil {
-			errs <- err
-		}
-		if err := out.Close(); err != nil {
-			errs <- err
+func ToFileLines[I any](path string, errs ErrorSink, cancelParent func()) SinkOperator[I] {
+	return func(in <-chan I) {
+		errO := make(chan error, 1)
+		errs <- errO
+		defer close(errO)
+		out, err := os.Create(path)
+		if err != nil {
+			drain(in, cancelParent)
+			errO <- err
 			return
 		}
-	}()
-	for line := range in {
-		if _, err := fmt.Fprintln(buf, line); err != nil {
-			errs <- err
-			return
+		buf := bufio.NewWriter(out)
+		defer func() {
+			if err := buf.Flush(); err != nil {
+				errO <- err
+				return
+			}
+			if err := out.Close(); err != nil {
+				errO <- err
+				return
+			}
+		}()
+		for line := range in {
+			if _, err := fmt.Fprintln(buf, line); err != nil {
+				errO <- err
+				return
+			}
 		}
 	}
 }
@@ -2055,10 +2074,92 @@ func ToSlices[I, L any](i <-chan I, l <-chan L) ([]I, []L) {
 }
 
 // ToFirst returns the first value emitted and then discards the rest of the input.
-func ToFirst[T any](in <-chan T, cancelParent func()) (t T, ok bool) {
-	t, ok = <-in
-	drain(in, cancelParent)
-	return t, ok
+func ToFirst[T any](in <-chan T, predicate func(T) bool, cancelParent func()) (t T, ok bool) {
+	v, ok := <-First(predicate, cancelParent)(in)
+	return v, ok
+}
+
+// ToFirstErr emits the first non-nil error.
+func ToFirstErr(errs chan error, cancelParent func()) <-chan error {
+	return First(func(err error) bool { return err != nil }, cancelParent)(errs)
+}
+
+type multierr struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (m *multierr) Add(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.errs = append(m.errs, err)
+}
+func (m *multierr) Error() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var sb strings.Builder
+	for i, err := range m.errs {
+		if i > 0 {
+			sb.WriteString(";")
+		}
+		sb.WriteString(err.Error())
+	}
+	return sb.String()
+}
+func (m *multierr) Unwrap() []error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.errs)
+}
+func (m *multierr) Len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.errs)
+}
+
+// CollectErrs processes all the given errors and returns a collection of them,
+// or nil.
+// If a cancel func is passed it will be called on the first non-nil error.
+func CollectErrs(cancel func()) Operator[Error, error] {
+	return func(errsc ErrorSource) <-chan error {
+		out := make(chan error)
+		go func() {
+			defer close(out)
+			var wg sync.WaitGroup
+			var o sync.Once
+			accum := &multierr{}
+			for c := range errsc {
+				wg.Add(1)
+				c := c
+				go func() {
+					defer wg.Done()
+					for err := range c {
+						if err != nil {
+							o.Do(cancel)
+							accum.Add(err)
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			if accum.Len() > 0 {
+				out <- accum
+			}
+		}()
+		return out
+	}
+}
+
+// ErrorScope is a helper to simplify error handling.
+func ErrorScope(cancel func()) (ErrorPipe, Error) {
+	errs := make(ErrorPipe)
+	err := CollectErrs(cancel)(errs)
+	return errs, err
+}
+
+func EndScope(errs ErrorPipe, err Error) error {
+	close(errs)
+	return <-err
 }
 
 // Collect calls the consume func once per every input item.
@@ -2077,8 +2178,8 @@ func Collect[T any](consume func(T) (ok bool), cancelParent func()) SinkOperator
 // AbortOnErr returns the first non-nil error encountered (cancelling the parent)
 // and discards the others.
 // If no error is encountered, it returns nil.
-func AbortOnErr(in <-chan error, cancelParent func()) error {
-	return <-First(func(err error) bool { return err != nil }, cancelParent)(in)
+func AbortOnErr(errs <-chan error, cancelParent func()) error {
+	return <-First(func(err error) bool { return err != nil }, cancelParent)(errs)
 }
 
 ///////////////////////////
