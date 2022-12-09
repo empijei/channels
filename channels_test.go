@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -139,6 +140,40 @@ func TestFromFunc(t *testing.T) {
 			}
 			if diff := cmpDiff(tt.want, got); diff != "" {
 				t.Errorf("-want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestFromReaderLines(t *testing.T) {
+	parallel(t)
+	var tests = []struct {
+		name string
+		in   []string
+	}{
+		{
+			name: "empty",
+		},
+		{
+			name: "one",
+			in:   []string{"a"},
+		},
+		{
+			name: "multi",
+			in:   []string{"a", "b", "cd", "foobar"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			instr := strings.Join(tt.in, "\n")
+			errs := make(chan error, 1)
+			lines := FromReaderLines(strings.NewReader(instr), errs)()
+			got := ToSliceParallel[string](lines)
+			if diff := cmpDiff(tt.in, <-got); diff != "" {
+				t.Errorf("-want +got:\n%s", diff)
+			}
+			if err := <-errs; err != nil {
+				t.Errorf("Unwanted err: %v", err)
 			}
 		})
 	}
@@ -925,7 +960,6 @@ func TestMapFilterCancelTeardown(t *testing.T) {
 			mapped := MapFilterCancelTeardown(func(i Triplet[int, bool, bool]) (string, bool, bool) {
 				return fmt.Sprint(i.A), i.B, i.C
 			},
-				cncl,
 				func(l Triplet[int, bool, bool], emitted bool) (string, bool) {
 					tdE = true
 					if got, want := emitted, len(tt.in) != 0; got != want {
@@ -938,6 +972,7 @@ func TestMapFilterCancelTeardown(t *testing.T) {
 					}
 					return tt.td.A, tt.td.B
 				},
+				cncl,
 			)(in)
 			got := ToSlice(mapped)
 			if cancelled != tt.wantCancel {
@@ -1995,6 +2030,7 @@ func TestStartWith(t *testing.T) {
 // TODO: WithLatestFrom
 
 func TestWithLatestFrom(t *testing.T) {
+	parallel(t)
 	in := make(chan int)
 	other := make(chan string)
 	cancelled := false
@@ -2051,6 +2087,7 @@ func TestTap(t *testing.T) {
 }
 
 func TestTimeout(t *testing.T) {
+	parallel(t)
 	t.Run("expired", func(t *testing.T) {
 		c := newStubClock()
 		cancelled := false
@@ -2094,6 +2131,7 @@ func TestTimeout(t *testing.T) {
 }
 
 func TestTeardown(t *testing.T) {
+	parallel(t)
 	t.Run("no emission", func(t *testing.T) {
 		in := make(chan int)
 		close(in)
@@ -2146,6 +2184,7 @@ func TestTeardown(t *testing.T) {
 }
 
 func TestEvery(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name             string
 		in               []int
@@ -2186,6 +2225,7 @@ func TestEvery(t *testing.T) {
 }
 
 func TestFindIndex(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name       string
 		in         []int
@@ -2226,6 +2266,7 @@ func TestFindIndex(t *testing.T) {
 }
 
 func TestIsEmpty(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name       string
 		in         []int
@@ -2260,6 +2301,7 @@ func TestIsEmpty(t *testing.T) {
 }
 
 func TestReduce(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		in   []int
@@ -2294,6 +2336,7 @@ func TestReduce(t *testing.T) {
 }
 
 func TestCount(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name string
 		in   []int
@@ -2327,6 +2370,7 @@ func TestCount(t *testing.T) {
 }
 
 func TestTeeMinMax(t *testing.T) {
+	parallel(t)
 	var tests = []struct {
 		name             string
 		in               []int

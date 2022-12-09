@@ -15,8 +15,13 @@
 package channels
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
 	"sync"
 	"time"
 
@@ -25,24 +30,10 @@ import (
 )
 
 /*
-TODO: point this out
-type declarations inside generic functions are not currently supported
-
-TODO: make ops that take an emitter also take a cancelParent that gets called when
-emit is closed, and drain input.
-
 TODO: make sure that wording like "forwards", "becomes a copy" etc. are consistently
 used and well defined in the doc.
 
 TODO: create a styleguide on when and where operators should be invoked.
-
-type outT = struct {
-a A
-b B
-}
-
-TODO: potentially create or require contexts for inner stuff that might be discarded
-and cancel them once they get discarded (e.g. for switchmap)
 
 TODO: check for if statements for first or similar conditions: can we set the condition inside the if?
 
@@ -50,8 +41,6 @@ TODO: check that all tests run in parallel.
 
 TODO: find the talk by Samir and see if we can solve the problem presented there with the
 operators in this package.
-
-TODO: check all outs are closed.
 
 TODO: consistency check on wording for docs.
 
@@ -61,30 +50,22 @@ TODO: check if I forgot some discards
 
 TODO: check that variables we close over are necessary
 
-TODO: find a way to return contextx when spawning subroutines the caller does not control
+TODO: find a way to return contexts when spawning subroutines the caller does not control
 
 TODO: inline composed operators
 
-TODO: chech that types for emit are D instead of other letters
+TODO: check that letters conventions are respected
 
-TODO: point out
-  // error: generic type cannot be alias
-	// MonoTypeOperator[T any] = Operator[T, T]
-
-TODO: express operators in terms of other operators.
+TODO: check that state variable are not preserved across calls.
 
 TODO: make time related operators get a clock in input
 
-TODO: say that there is no reduce because we have closures
-
-TODO: check that cancelParent is propagated
-
 TODO: document that reusing a constructor might have unexpected results (e.g. distinct filters also stuff from previous runs).
 
-TODO: figure out a consistent way for parameters passing (e.g. cancelParent, parallelism and stuff should all be in the same order,
-	and cancelParent should probably be last).
+TODO: figure out a consistent way for parameters passing:
+ * cancelParent should be last
+ * parallelism and similar stuff should be first
 
-	TODO: check that state variable are not preserved across calls.
 */
 
 ///////////
@@ -209,6 +190,46 @@ func FromRange(start, end int) SourceOperator[int] {
 			for i := start; i < end; i++ {
 				out <- i
 			}
+		}()
+		return out
+	}
+}
+
+// FromReaderLines emits all of the lines of the reader.
+// If an error is encountered it's emitted on the errs chan,
+// otherwise a nil one is emitted when the read is finished.
+func FromReaderLines(r io.Reader, errs chan<- error) SourceOperator[string] {
+	return func() <-chan string {
+		out := make(chan string)
+		go func() {
+			defer close(out)
+			s := bufio.NewScanner(r)
+			for s.Scan() {
+				out <- s.Text()
+			}
+			errs <- s.Err()
+		}()
+		return out
+	}
+}
+
+// FromFileLines is like FromReaderLines but for files.
+func FromFileLines(fsys fs.FS, path string, errs chan<- error) SourceOperator[string] {
+	return func() <-chan string {
+		out := make(chan string)
+		go func() {
+			defer close(out)
+			f, err := fsys.Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer f.Close()
+			s := bufio.NewScanner(f)
+			for s.Scan() {
+				out <- s.Text()
+			}
+			errs <- s.Err()
 		}()
 		return out
 	}
@@ -847,8 +868,8 @@ func MapFilterCancel[I, O any](project func(in I) (projected O, emit, ok bool), 
 // It is like a combination of MapFilter, MapCancel and Teardown.
 func MapFilterCancelTeardown[I, O any](
 	project func(in I) (projected O, emit, ok bool),
-	cancelParent func(),
 	teardown func(last I, emitted bool) (lastItem O, shouldEmitLast bool),
+	cancelParent func(),
 ) Operator[I, O] {
 	return func(in <-chan I) <-chan O {
 		out := make(chan O)
@@ -1961,6 +1982,33 @@ func Wait[D any]() SinkOperator[D] {
 	}
 }
 
+// ToFileLines truncates or creates the file at the specified path and writes to it
+// all inputs as lines (using fmt.Fprintln).
+func ToFileLines(path string, in <-chan any, errs chan<- error, cancelParent func()) {
+	out, err := os.Create(path)
+	if err != nil {
+		drain(in, cancelParent)
+		errs <- err
+		return
+	}
+	buf := bufio.NewWriter(out)
+	defer func() {
+		if err := buf.Flush(); err != nil {
+			errs <- err
+		}
+		if err := out.Close(); err != nil {
+			errs <- err
+			return
+		}
+	}()
+	for line := range in {
+		if _, err := fmt.Fprintln(buf, line); err != nil {
+			errs <- err
+			return
+		}
+	}
+}
+
 // ToSlice collects all inputs in a slice.
 func ToSlice[T any](in <-chan T) []T {
 	var res []T
@@ -2004,6 +2052,13 @@ func ToSlices[I, L any](i <-chan I, l <-chan L) ([]I, []L) {
 	}()
 	wg.Wait()
 	return ri, rl
+}
+
+// ToFirst returns the first value emitted and then discards the rest of the input.
+func ToFirst[T any](in <-chan T, cancelParent func()) (t T, ok bool) {
+	t, ok = <-in
+	drain(in, cancelParent)
+	return t, ok
 }
 
 // Collect calls the consume func once per every input item.

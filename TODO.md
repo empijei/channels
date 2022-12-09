@@ -93,17 +93,19 @@ Moar
 * [ ] FanOut(<-chan)[]<-chan
 * [ ] FanIn([]<-chan)<-chan
 * [ ] BufferChan
-* [ ] Tee
+* [x] Tee
 * [ ] Clone
 * [ ] TapAccum
 * [ ] WithTearDown (accepts a cleanup func)
 * [ ] SampleN
 * [ ] SamplePercent
-* [ ] ParallelMap
-* [ ] ParallelMapStable
+* [x] ParallelMap
+* [x] ParallelMapStable
 * [ ] Multicast
-* [ ] ScanAccum
+* [x] ScanAccum
 * [ ] Lossy (discard when you can't send)
 * [ ] CollectFirst(<-chan T)T
 * [ ] WithTearDown
 * [ ] LimitedSuccesses
+* [ ] From/To CSV
+* [ ] ToFileLines[Ordered|fmt.Stringer]
