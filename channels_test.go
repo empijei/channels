@@ -17,6 +17,8 @@ package channels_test
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -168,7 +170,7 @@ func TestFromReaderLines(t *testing.T) {
 			instr := strings.Join(tt.in, "\n")
 			errs := make(chan error, 1)
 			lines := FromReaderLines(strings.NewReader(instr), errs)()
-			got := ToSliceParallel[string](lines)
+			got := ToSliceParallel(lines)
 			if diff := cmpDiff(tt.in, <-got); diff != "" {
 				t.Errorf("-want +got:\n%s", diff)
 			}
@@ -176,6 +178,25 @@ func TestFromReaderLines(t *testing.T) {
 				t.Errorf("Unwanted err: %v", err)
 			}
 		})
+	}
+}
+
+func TestFromFileLines(t *testing.T) {
+	parallel(t)
+
+	d := t.TempDir()
+	f := filepath.Join(d, "TestFromFileLines")
+	os.WriteFile(f, []byte("foo\nbar\ncat"), 0666)
+
+	errp, errs := ErrorScope(nil)
+
+	lines := FromFileLines(f, errp)()
+	got := ToSliceParallel(lines)
+	if diff := cmpDiff([]string{"foo", "bar", "cat"}, <-got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+	if err := EndScope(errp, errs); err != nil {
+		t.Errorf("Unwanted err: %v", err)
 	}
 }
 
@@ -662,11 +683,45 @@ func TestBufferTime(t *testing.T) {
 	in <- 6
 	emit() // [4,5,6]
 	in <- 7
-	close(in) // [1] Leftorvers should be emitted
+	close(in) // [7] Leftorvers should be emitted
 
 	got := <-gotch
 
 	want := [][]int{{1, 2}, {3}, {4, 5, 6}, {7}}
+
+	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+}
+
+func TestBufferTimeOrCount(t *testing.T) {
+	parallel(t)
+	s := newStubTicker()
+	f := newStubTickerFactory(t, 1*time.Second, s)
+	now := time.Now()
+	emit := func() {
+		now = now.Add(1 * time.Second)
+		s <- now
+	}
+	buffered := BufferTimeOrCount[int](f, 1*time.Second, 2)
+	in := make(chan int)
+	gotch := ToSliceParallel(buffered(in))
+
+	emit() // Attempt empty emission, should be absorbed.
+	in <- 1
+	in <- 2 // [1, 2]
+	in <- 3
+	emit() // [3]
+	in <- 4
+	in <- 5 // [4, 5]
+	in <- 6
+	emit() // [6]
+	in <- 7
+	close(in) // [7] Leftorvers should be emitted
+
+	got := <-gotch
+
+	want := [][]int{{1, 2}, {3}, {4, 5}, {6}, {7}}
 
 	if diff := cmpDiff(want, got); diff != "" {
 		t.Errorf("-want +got:\n%s", diff)
@@ -703,6 +758,22 @@ func TestBufferToggle(t *testing.T) {
 	want := [][]int{{3, 4}, {6}, {7}}
 
 	if diff := cmpDiff(want, got); diff != "" {
+		t.Errorf("-want +got:\n%s", diff)
+	}
+}
+
+func TestBufferChan(t *testing.T) {
+	parallel(t)
+
+	in := make(chan int)
+	out := BufferChan[int](5)(in)
+	for i := 0; i < 5; i++ {
+		in <- i
+	}
+	close(in)
+	got := ToSlice(out)
+
+	if diff := cmpDiff([]int{0, 1, 2, 3, 4}, got); diff != "" {
 		t.Errorf("-want +got:\n%s", diff)
 	}
 }

@@ -35,6 +35,8 @@ import (
 TODO: make sure that wording like "forwards", "becomes a copy" etc. are consistently
 used and well defined in the doc.
 
+TODO: simplify error handling, it's currently a mess
+
 TODO: create a styleguide on when and where operators should be invoked.
 
 TODO: check for if statements for first or similar conditions: can we set the condition inside the if?
@@ -682,6 +684,58 @@ func BufferTime[T any](tickerFactory func(time.Duration) Ticker, duration time.D
 	}
 }
 
+// BufferTimeOrCount buffers input for at most maxCount elements and at most duration time.
+// If tickerFactory is nil, the real time is used.
+func BufferTimeOrCount[T any](tickerFactory func(time.Duration) Ticker, duration time.Duration, maxCount int) Operator[T, []T] {
+	if tickerFactory == nil {
+		tickerFactory = NewRealTicker
+	}
+	return func(in <-chan T) <-chan []T {
+		t := tickerFactory(duration)
+		emit := t.Chan()
+		out := make(chan []T)
+		go func() {
+			defer close(out)
+			defer t.Stop()
+
+			var buf []T
+			emitBuf := func() {
+				if len(buf) == 0 {
+					return
+				}
+				out <- buf
+				buf = nil
+			}
+
+			for {
+				select {
+				case v, ok := <-in:
+					if !ok {
+						// Input is closed, emit the last values (if any) and exit.
+						emitBuf()
+						return
+					}
+					buf = append(buf, v)
+					if len(buf) >= maxCount {
+						emitBuf()
+						t.Stop()
+						t = tickerFactory(duration)
+						emit = t.Chan()
+					}
+				case _, ok := <-emit:
+					emitBuf()
+					if !ok {
+						// Emitter is closed, exit.
+						return
+					}
+				}
+			}
+		}()
+
+		return out
+	}
+}
+
 // BufferToggle buffers elements between an emission of openings and an emission of closings.
 // Two consecutive emissions of openings or closings are ignored.
 // If the buffer is open when any of the inputs ends the leftovers are emitted without
@@ -737,7 +791,27 @@ func BufferToggle[T, I1, I2 any](openings <-chan I1, closings <-chan I2) Operato
 	}
 }
 
+// BufferChan returns a buffered channel that copies the input emissions.
+// If a non-positive count is passed an arbitrary value is used.
+func BufferChan[T any](count int) Operator[T, T] {
+	return func(in <-chan T) <-chan T {
+		if count <= 0 {
+			count = runtime.NumCPU()
+		}
+		c := make(chan T, count)
+		go func() {
+			defer close(c)
+			for v := range in {
+				c <- v
+			}
+		}()
+		return c
+	}
+}
+
+// ConcatMap calls Map(project) and then concats the resulting emitters to a single one.
 func ConcatMap[I, O any](project func(in I) <-chan O) Operator[I, O] {
+	// TODO(empijei): express as a single operator.
 	return Combine(
 		Map(project),
 		Concat[O](),
